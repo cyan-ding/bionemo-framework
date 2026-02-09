@@ -1,11 +1,11 @@
 - datapaths: ["/home/ubuntu/cyan/denny/unprocessed/initial_refseq.fna"]
   output_dir: "/home/ubuntu/cyan/denny/preprocessed/"
-  output_prefix: ncbi_viruses_homo_sapiens_uint8
+  output_prefix: denny_uint8
   train_split: 0.9
   valid_split: 0.05
   test_split: 0.05
   overwrite: True
-  embed_reverse_complement: true
+  embed_reverse_complement: false
   random_reverse_complement: 0.0
   random_lineage_dropout: 0.0
   include_sequence_id: false
