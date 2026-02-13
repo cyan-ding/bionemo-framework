@@ -97,6 +97,9 @@ class Evo2PreprocessingConfig(BaseModel):
     # Evo2 Taxonomic Lineage Tags
     # SeqID Sub-String Indexing: "ABC" will have taxonomy data from "A".
     taxonomy_data: dict[str, Evo2TaxonomyLineage] = {}
+    # Lineage applied to all sequences when no seqid matches taxonomy_data. Use this to apply
+    # the same taxonomy tokens everywhere without listing every sequence ID.
+    default_lineage: None | Evo2TaxonomyLineage = None
     # Periodicity of injecting phylogenetic lineage tags in the sequence prior to tokenization.
     prompt_spacer_length: int = 131072
     polio_reference_path: None | Path = None

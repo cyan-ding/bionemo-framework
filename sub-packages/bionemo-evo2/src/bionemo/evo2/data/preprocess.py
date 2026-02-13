@@ -244,6 +244,9 @@ class Evo2Preprocessor:
             if id in seqid:
                 lineage = tax
                 break
+        # Fall back to default_lineage when no seqid match (apply same taxonomy everywhere).
+        if lineage is None and config.default_lineage is not None:
+            lineage = config.default_lineage
 
         # Preprocess data.
         preproc_data = []
