@@ -273,9 +273,8 @@ class Evo2Preprocessor:
                 if config.polio_reference_path is not None:
                     alignment_score = compute_polio_alignment(seq, config.polio_reference_path)
                     alignment_token = get_alignment_token(alignment_score)
-    
-                if alignment_token:
-                    seq = alignment_token + seq
+
+                
                 # Construct taxonomy token with random dropout on the lineage categories per sequence.
                 taxonomy_token = self._construct_taxonomy_token(lineage, dropout=config.random_lineage_dropout)
 
@@ -285,7 +284,7 @@ class Evo2Preprocessor:
                     config.prompt_spacer_length - len(taxonomy_token) if taxonomy_token is not None else None
                 )
                 taxonomy_injected_sequence = [
-                    taxonomy_token + str(subseq) if taxonomy_token is not None else str(subseq)
+                    alignment_token + taxonomy_token + str(subseq) if taxonomy_token is not None else str(alignment_token+ subseq)
                     for subseq in self._subsequence_generator(seq, target_length, target_length)
                 ]
 
