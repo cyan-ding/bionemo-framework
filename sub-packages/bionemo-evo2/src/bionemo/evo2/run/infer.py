@@ -205,6 +205,7 @@ def infer(
             logging.info(results)
         else:
             import json
+            # jsonl, one entry per line
             data = {
                 "request_id": results[0].request_id,
                 "prompt": results[0].prompt,
@@ -216,7 +217,8 @@ def infer(
                 ),
             }
             with open(output_file, "a") as f:
-                json.dump(data, f, indent=2)
+                json.dump(data, f)
+                f.write("\n")
 
     return results
 
