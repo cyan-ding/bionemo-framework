@@ -171,8 +171,8 @@ def infer(
         path=ckpt_dir,
         trainer=trainer,
         params_dtype=torch.bfloat16,
-        inference_batch_times_seqlen_threshold=8192,  # TODO
-        inference_max_seq_length=8192,  # TODO
+        inference_batch_times_seqlen_threshold=10240,  # TODO
+        inference_max_seq_length=10240,  # TODO
         recompute_granularity=None,
         recompute_num_layers=None,
         recompute_method=None,
@@ -204,8 +204,19 @@ def infer(
         if output_file is None:
             logging.info(results)
         else:
-            with open(output_file, "w") as f:
-                f.write(f"{results[0]}\n")
+            import json
+            data = {
+                "request_id": results[0].request_id,
+                "prompt": results[0].prompt,
+                "generated_text": results[0].generated_text,
+                "status": results[0].status.name if results[0].status else None,
+                "num_tokens_to_generate": (
+                    results[0].sampling_params.num_tokens_to_generate
+                    if results[0].sampling_params else None
+                ),
+            }
+            with open(output_file, "a") as f:
+                json.dump(data, f, indent=2)
 
     return results
 
