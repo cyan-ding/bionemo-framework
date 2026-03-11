@@ -61,6 +61,12 @@ def parse_args():
     ap.add_argument("--top-p", type=float, default=0.0, help="Top P during sampling for generation.")
     ap.add_argument("--max-new-tokens", type=int, default=1024, help="Maximum number of tokens to generate.")
     ap.add_argument("--seed", type=int, default=None, help="Random seed for generation.")
+    ap.add_argument(
+        "--num-runs",
+        type=int,
+        default=1,
+        help="Number of inference runs with the same prompt. Model is loaded once. Defaults to 1.",
+    )
     # compute args:
     ap.add_argument("--tensor-parallel-size", type=int, default=1, help="Order of tensor parallelism. Defaults to 1.")
     ap.add_argument(
@@ -112,6 +118,7 @@ def infer(
     output_file: Optional[str] = None,
     ckpt_format: CheckpointFormats = "torch_dist",
     seed: Optional[int] = None,
+    num_runs: int = 1,
     vortex_style_fp8: bool = False,
     flash_decode: bool = False,
     return_log_probs: bool = False,
@@ -180,47 +187,58 @@ def infer(
         flash_decode=flash_decode,
         enable_flash_decode=flash_decode,
     )
-    t0 = time.perf_counter_ns()
-    # TODO: fix return type in NeMo inference.generate (it is a list[InferenceRequest] not a dict)
-    results: list[InferenceRequest] = inference.generate(
-        model=inference_wrapped_model,
-        max_batch_size=1,  # vortex only supports batch size 1
-        tokenizer=mcore_tokenizer,
-        prompts=[prompt],
-        random_seed=seed,
-        inference_params=CommonInferenceParams(
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            return_log_probs=return_log_probs,
-            num_tokens_to_generate=max_new_tokens,
-        ),
-    )
-    dt = (time.perf_counter_ns() - t0) / 1e9  # seconds
-    tokens_per_sec = (len(results[0].generated_text) + 1) / dt  # +1 for the prompt
 
-    print(f"Inference time: {dt} seconds, {tokens_per_sec} tokens/sec", file=sys.stderr)
-    if torch.distributed.get_rank() == 0:
-        if output_file is None:
-            logging.info(results)
-        else:
-            import json
-            # jsonl, one entry per line
-            data = {
-                "request_id": results[0].request_id,
-                "prompt": results[0].prompt,
-                "generated_text": results[0].generated_text,
-                "status": results[0].status.name if results[0].status else None,
-                "num_tokens_to_generate": (
-                    results[0].sampling_params.num_tokens_to_generate
-                    if results[0].sampling_params else None
-                ),
-            }
-            with open(output_file, "a") as f:
-                json.dump(data, f)
-                f.write("\n")
+    all_results: list[InferenceRequest] = []
+    for run_idx in range(num_runs):
+        run_seed = seed if seed is not None else None
+        t0 = time.perf_counter_ns()
+        # TODO: fix return type in NeMo inference.generate (it is a list[InferenceRequest] not a dict)
+        results: list[InferenceRequest] = inference.generate(
+            model=inference_wrapped_model,
+            max_batch_size=1,  # vortex only supports batch size 1
+            tokenizer=mcore_tokenizer,
+            prompts=[prompt],
+            random_seed=run_seed,
+            inference_params=CommonInferenceParams(
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                return_log_probs=return_log_probs,
+                num_tokens_to_generate=max_new_tokens,
+            ),
+        )
+        dt = (time.perf_counter_ns() - t0) / 1e9  # seconds
+        tokens_per_sec = (len(results[0].generated_text) + 1) / dt  # +1 for the prompt
 
-    return results
+        print(
+            f"Run {run_idx + 1}/{num_runs}: {dt:.2f}s, {tokens_per_sec:.1f} tokens/sec",
+            file=sys.stderr,
+        )
+        if torch.distributed.get_rank() == 0:
+            if output_file is None:
+                logging.info(results)
+            else:
+                import json
+
+                # jsonl, one entry per line
+                data = {
+                    "request_id": results[0].request_id,
+                    "run": run_idx + 1,
+                    "prompt": results[0].prompt,
+                    "generated_text": results[0].generated_text,
+                    "status": results[0].status.name if results[0].status else None,
+                    "num_tokens_to_generate": (
+                        results[0].sampling_params.num_tokens_to_generate
+                        if results[0].sampling_params
+                        else None
+                    ),
+                }
+                with open(output_file, "a") as f:
+                    json.dump(data, f)
+                    f.write("\n")
+        all_results.extend(results)
+
+    return all_results
 
 
 def main():
@@ -240,6 +258,7 @@ def main():
         output_file=args.output_file,
         ckpt_format=args.ckpt_format,
         seed=args.seed,
+        num_runs=args.num_runs,
         vortex_style_fp8=args.fp8,  # Vortex only applied FP8 to some layers.
         flash_decode=args.flash_decode,
     )
