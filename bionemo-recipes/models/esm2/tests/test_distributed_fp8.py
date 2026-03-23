@@ -97,7 +97,12 @@ if __name__ == "__main__":
     import argparse
     import enum
     import os
+    import sys
     from dataclasses import dataclass, field
+    from pathlib import Path
+
+    # Ensure the model directory is on sys.path for bare module imports.
+    sys.path.insert(0, Path(__file__).resolve().parent.parent.as_posix())
 
     import torch.distributed as dist
     import transformer_engine.pytorch
@@ -107,7 +112,7 @@ if __name__ == "__main__":
     from torch.optim import AdamW
     from transformer_engine.pytorch.fp8 import DelayedScaling, Format
 
-    from esm.modeling_esm_te import NVEsmConfig, NVEsmForMaskedLM
+    from modeling_esm_te import NVEsmConfig, NVEsmForMaskedLM
 
     def recursive_assert(a, b, path=""):
         if isinstance(a, dict) and isinstance(b, dict):
@@ -160,7 +165,7 @@ if __name__ == "__main__":
     model = NVEsmForMaskedLM(config)
 
     if args.strategy is Strategy.FSDP2:
-        for layer in model.esm.encoder.layers:
+        for layer in model.model.encoder.layers:
             fully_shard(layer, mesh=device_mesh["dp"])
         fully_shard(model, mesh=device_mesh["dp"])
         model.to(device)

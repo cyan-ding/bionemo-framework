@@ -720,7 +720,7 @@ def test_cp_dataloader(tokenizer_path):
 
         train_dataloader.collate_fn = DataCollatorForContextParallel(
             collator=train_dataloader.collate_fn,
-            cp_world_size=cp_mesh.size(),
+            device_mesh=cp_mesh,
             is_causal_lm=True,
         )
     else:
@@ -738,7 +738,6 @@ def test_cp_dataloader(tokenizer_path):
             "input_ids",
             "cu_seq_lens_q",
             "cu_seq_lens_k",
-            "attention_mask",
             "labels",
             "cu_seq_lens_q_padded",
             "cu_seq_lens_k_padded",
@@ -762,6 +761,7 @@ def test_cp_dataloader_multi_gpu(recipe_path, dataset_path):
 
     cmd = [
         "torchrun",
+        "--standalone",
         "--nproc_per_node=2",
         "tests/test_dataset.py",
         "--dataset_path",
@@ -818,7 +818,7 @@ if __name__ == "__main__":
 
         train_dataloader.collate_fn = DataCollatorForContextParallel(
             collator=train_dataloader.collate_fn,
-            cp_world_size=cp_mesh.size(),
+            device_mesh=cp_mesh,
             is_causal_lm=True,
         )
     else:
@@ -854,4 +854,5 @@ if __name__ == "__main__":
         assert batch["labels"] is None
         assert batch["shift_labels"].shape[1] == actual_shape
 
+    dataloader.close()
     torch.distributed.destroy_process_group()

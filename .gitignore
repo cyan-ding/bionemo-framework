@@ -210,3 +210,8 @@ checkpoints/
 
 # Hydra outputs
 outputs/
+
+# Nsys profiles
+*.nsys-rep
+
+.claude/

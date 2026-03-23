@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import copy
+import threading
 from typing import Dict, Iterator, List
 from unittest import mock
 
@@ -22,7 +23,7 @@ import torch
 from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import pad_thd_sequences_for_cp
 from transformers import DataCollatorForLanguageModeling
 
-from esm.collator import (
+from collator import (
     BatchType,
     ContextParallelDataLoaderWrapper,
     DataCollatorForContextParallel,
@@ -201,6 +202,36 @@ def get_dummy_data_thd_dp1_nopadding():
     return batch
 
 
+class _DummyCollatorMesh:
+    """Dummy device mesh for testing DataCollatorForContextParallel.
+
+    Supports the `.mesh_dim_names` and `.size(dim_name)` interface that the collator needs.
+    """
+
+    def __init__(self, cp_size: int, tp_size: int | None = None, tp_first: bool = False):
+        if tp_size is not None:
+            if tp_first:
+                self._sizes = {"tp": tp_size, "cp": cp_size}
+            else:
+                self._sizes = {"cp": cp_size, "tp": tp_size}
+        else:
+            self._sizes = {"cp": cp_size}
+
+    @property
+    def mesh_dim_names(self):
+        return tuple(self._sizes.keys())
+
+    def size(self, dim=None):
+        if dim is None:
+            result = 1
+            for v in self._sizes.values():
+                result *= v
+            return result
+        if isinstance(dim, int):
+            return list(self._sizes.values())[dim]
+        return self._sizes[dim]
+
+
 class _DummyLoader:
     """Minimal iterable that always yields the same object (batch or list)."""
 
@@ -368,7 +399,7 @@ def test_dataloader_scatter_nopadding():
         loader_rank1 = ContextParallelDataLoaderWrapper(None, cp_mesh_rank1)
 
         scatter_payload: Dict[str, List[Dict[str, torch.Tensor]]] = {}
-        current_rank = {"value": None}
+        data_ready = threading.Event()
 
         def fake_scatter(
             *,
@@ -378,21 +409,23 @@ def test_dataloader_scatter_nopadding():
             group_src,
         ):
             if scatter_object_input_list is not None:
+                # Rank 0: store the full payload and return shard 0
                 scatter_payload["data"] = scatter_object_input_list
-            assert "data" in scatter_payload, "Rank 0 payload missing"
-            scatter_object_output_list[0] = scatter_payload["data"][current_rank["value"]]
+                data_ready.set()
+                scatter_object_output_list[0] = scatter_object_input_list[0]
+            else:
+                # Rank 1: wait for rank 0's data, then return shard 1
+                data_ready.wait(timeout=5)
+                scatter_object_output_list[0] = scatter_payload["data"][1]
 
         with (
-            mock.patch("esm.collator.torch.distributed.scatter_object_list", side_effect=fake_scatter),
-            mock.patch("esm.collator.torch.distributed.barrier", return_value=None),
+            mock.patch("collator.torch.distributed.scatter_object_list", side_effect=fake_scatter),
+            mock.patch("collator.torch.distributed.barrier", return_value=None),
         ):
             iter(loader_rank0)
             iter(loader_rank1)
 
-            current_rank["value"] = 0
             batch_cp0 = next(loader_rank0)
-
-            current_rank["value"] = 1
             batch_cp1 = next(loader_rank1)
 
         return batch_cp0, batch_cp1
@@ -457,7 +490,7 @@ def test_dataloader_scatter_with_pad_between_seqs():
         loader_rank1 = ContextParallelDataLoaderWrapper(None, cp_mesh_rank1)
 
         scatter_payload: Dict[str, List[Dict[str, torch.Tensor]]] = {}
-        current_rank = {"value": None}
+        data_ready = threading.Event()
 
         def fake_scatter(
             *,
@@ -467,21 +500,23 @@ def test_dataloader_scatter_with_pad_between_seqs():
             group_src,
         ):
             if scatter_object_input_list is not None:
+                # Rank 0: store the full payload and return shard 0
                 scatter_payload["data"] = scatter_object_input_list
-            assert "data" in scatter_payload, "Rank 0 payload missing"
-            scatter_object_output_list[0] = scatter_payload["data"][current_rank["value"]]
+                data_ready.set()
+                scatter_object_output_list[0] = scatter_object_input_list[0]
+            else:
+                # Rank 1: wait for rank 0's data, then return shard 1
+                data_ready.wait(timeout=5)
+                scatter_object_output_list[0] = scatter_payload["data"][1]
 
         with (
-            mock.patch("esm.collator.torch.distributed.scatter_object_list", side_effect=fake_scatter),
-            mock.patch("esm.collator.torch.distributed.barrier", return_value=None),
+            mock.patch("collator.torch.distributed.scatter_object_list", side_effect=fake_scatter),
+            mock.patch("collator.torch.distributed.barrier", return_value=None),
         ):
             iter(loader_rank0)
             iter(loader_rank1)
 
-            current_rank["value"] = 0
             batch_cp0 = next(loader_rank0)
-
-            current_rank["value"] = 1
             batch_cp1 = next(loader_rank1)
 
         return batch_cp0, batch_cp1
@@ -904,12 +939,14 @@ def test_data_collator_for_context_parallel_returns_correct_list_size(tokenizer,
     )
 
     # Create the context parallel collator
-    cp_collator = DataCollatorForContextParallel(collator=base_collator, cp_world_size=cp_world_size)
+    cp_collator = DataCollatorForContextParallel(
+        collator=base_collator, device_mesh=_DummyCollatorMesh(cp_size=cp_world_size)
+    )
 
     # Create test sequences
     features = [
-        {"input_ids": [0, 5, 6, 7, 8, 9, 10, 2]},  # 8 tokens
-        {"input_ids": [0, 11, 12, 13, 14, 15, 16, 17, 2]},  # 9 tokens
+        {"input_ids": [0, 5, 6, 7, 8, 9, 10, 2], "attention_mask": [1, 1, 1, 1, 1, 1, 1, 1]},  # 8 tokens
+        {"input_ids": [0, 11, 12, 13, 14, 15, 16, 17, 2], "attention_mask": [1, 1, 1, 1, 1, 1, 1, 1, 1]},  # 9 tokens
     ]
 
     # Call the collator
@@ -933,7 +970,9 @@ def test_data_collator_for_context_parallel_thd(tokenizer):
     )
 
     # Create the context parallel collator
-    cp_collator = DataCollatorForContextParallel(collator=base_collator, cp_world_size=cp_world_size)
+    cp_collator = DataCollatorForContextParallel(
+        collator=base_collator, device_mesh=_DummyCollatorMesh(cp_size=cp_world_size)
+    )
 
     # Create test sequences
     features = [
@@ -971,7 +1010,7 @@ def test_data_collator_for_context_parallel_thd_causal_lm(tokenizer):
 
     # Create the context parallel collator
     cp_collator = DataCollatorForContextParallel(
-        collator=base_collator, cp_world_size=cp_world_size, is_causal_lm=True
+        collator=base_collator, device_mesh=_DummyCollatorMesh(cp_size=cp_world_size), is_causal_lm=True
     )
 
     # Create test sequences
@@ -1010,6 +1049,125 @@ def test_data_collator_for_context_parallel_thd_causal_lm(tokenizer):
     torch.testing.assert_close(result[1]["shift_labels"], expected_rank1_shift_labels)
 
 
+def test_data_collator_for_context_parallel_thd_correctness(tokenizer):
+    """Test that DataCollatorForContextParallel returns correct values for THD format.
+
+    This test verifies:
+    1. max_length_q and max_length_k are correctly rounded up to a multiple of 64
+    2. input_ids and labels have the correct shape (sharded by cp_world_size)
+    3. cu_seq_lens_* tensors are preserved correctly
+    4. All shards together reconstruct the original data
+    """
+    cp_world_size = 2
+    divisibility_factor = 2 * cp_world_size
+
+    # Create the wrapped collator that produces padded THD batches - disable MLM for deterministic testing
+    base_collator = DataCollatorWithFlattening(
+        collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
+        pad_sequences_to_be_divisible_by=divisibility_factor,
+    )
+
+    # Create the context parallel collator
+    cp_collator = DataCollatorForContextParallel(
+        collator=base_collator, device_mesh=_DummyCollatorMesh(cp_size=cp_world_size), qkv_format="thd"
+    )
+
+    # Create test sequences - 8 tokens each for easy division
+    features = [
+        {"input_ids": [0, 5, 6, 7, 8, 9, 10, 2]},  # 8 tokens
+        {"input_ids": [0, 11, 12, 13, 14, 15, 16, 2]},  # 8 tokens
+    ]
+
+    # Call the collator
+    result = cp_collator(features)
+
+    assert len(result) == cp_world_size
+
+    # Verify max_length_q and max_length_k are rounded up to a multiple of 64
+    for cp_rank, shard in enumerate(result):
+        max_length = shard["max_length_q"]
+        assert max_length == shard["max_length_k"], "max_length_q and max_length_k should be equal"
+        assert max_length % 64 == 0, f"CP rank {cp_rank}: max_length {max_length} should be a multiple of 64"
+        # Since our sequences are 8 tokens, padded to divisibility_factor=4, max_seqlen should be 8,
+        # and rounded up to 64
+        assert max_length == 64, f"CP rank {cp_rank}: expected max_length=64, got {max_length}"
+
+    # Verify input_ids shape - should be sharded along sequence dimension
+    # Original total tokens: 16 (8+8), each shard should have 16 / cp_world_size = 8 tokens
+    for cp_rank, shard in enumerate(result):
+        assert shard["input_ids"].shape[1] == 8, (
+            f"CP rank {cp_rank}: expected input_ids shape [1, 8], got {shard['input_ids'].shape}"
+        )
+        assert shard["labels"].shape[1] == 8, (
+            f"CP rank {cp_rank}: expected labels shape [1, 8], got {shard['labels'].shape}"
+        )
+
+    # Verify that all shards together contain all the original tokens
+    all_input_ids = torch.cat([shard["input_ids"] for shard in result], dim=1)
+    # Check that all original tokens are present (sorted comparison since order may differ due to sharding)
+    expected_tokens = torch.tensor([[0, 5, 6, 7, 8, 9, 10, 2, 0, 11, 12, 13, 14, 15, 16, 2]], dtype=torch.int64)
+    torch.testing.assert_close(
+        torch.sort(all_input_ids.flatten())[0],
+        torch.sort(expected_tokens.flatten())[0],
+        msg="Sharded tokens don't match original tokens",
+    )
+
+    # Verify cu_seq_lens_q_padded and cu_seq_lens_k_padded are preserved in each shard
+    for cp_rank, shard in enumerate(result):
+        assert "cu_seq_lens_q_padded" in shard
+        assert "cu_seq_lens_k_padded" in shard
+        torch.testing.assert_close(shard["cu_seq_lens_q_padded"], shard["cu_seq_lens_k_padded"])
+
+    # Verify pad_between_seqs is True for THD format
+    for cp_rank, shard in enumerate(result):
+        assert shard["pad_between_seqs"] is True, f"CP rank {cp_rank}: pad_between_seqs should be True for THD format"
+
+
+@pytest.mark.parametrize(
+    "max_seqlen,expected_rounded",
+    [
+        (8, 64),  # Small value rounds up to 64
+        (64, 64),  # Exactly 64 stays 64
+        (65, 128),  # Just over 64 rounds up to 128
+        (100, 128),  # 100 rounds up to 128
+        (128, 128),  # Exactly 128 stays 128
+        (129, 192),  # Just over 128 rounds up to 192
+    ],
+)
+def test_data_collator_for_context_parallel_thd_max_length_rounding(tokenizer, max_seqlen, expected_rounded):
+    """Test that max_length_q/k is correctly rounded up to a multiple of 64 for various sequence lengths."""
+    cp_world_size = 2
+    divisibility_factor = 2 * cp_world_size
+
+    # Create input_ids of the specified length (must be divisible by divisibility_factor)
+    # We pad to the next multiple of divisibility_factor if needed
+    padded_len = ((max_seqlen + divisibility_factor - 1) // divisibility_factor) * divisibility_factor
+    input_ids = [0, *list(range(5, 5 + padded_len - 2)), 2]  # [CLS] + tokens + [SEP]
+    input_ids = input_ids[:padded_len]  # Truncate to exact length
+
+    # Create the collators
+    base_collator = DataCollatorWithFlattening(
+        collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
+        pad_sequences_to_be_divisible_by=divisibility_factor,
+    )
+    cp_collator = DataCollatorForContextParallel(
+        collator=base_collator, device_mesh=_DummyCollatorMesh(cp_size=cp_world_size), qkv_format="thd"
+    )
+
+    # Use a single sequence to ensure max_seqlen is exactly what we expect after padding
+    features = [{"input_ids": input_ids}]
+    result = cp_collator(features)
+
+    # The actual max_seqlen after padding may differ, but it should still round correctly
+    for shard in result:
+        max_length = shard["max_length_q"]
+        assert max_length % 64 == 0, f"max_length {max_length} should be a multiple of 64"
+        # Verify the rounding formula: ((x + 63) // 64) * 64
+        actual_seqlen = (shard["cu_seq_lens_q_padded"][1:] - shard["cu_seq_lens_q_padded"][:-1]).max().item()
+        expected = ((actual_seqlen + 63) // 64) * 64
+        assert max_length == expected, f"Expected max_length={expected} for seqlen={actual_seqlen}, got {max_length}"
+
+
 def test_data_collator_for_context_parallel_bshd(tokenizer):
     """Test that each shard from DataCollatorForContextParallel has all required keys from BatchType."""
 
@@ -1025,7 +1183,7 @@ def test_data_collator_for_context_parallel_bshd(tokenizer):
 
     # Create the context parallel collator
     cp_collator = DataCollatorForContextParallel(
-        collator=base_collator, cp_world_size=cp_world_size, qkv_format="bshd"
+        collator=base_collator, device_mesh=_DummyCollatorMesh(cp_size=cp_world_size), qkv_format="bshd"
     )
 
     # Create test sequences
@@ -1047,3 +1205,123 @@ def test_data_collator_for_context_parallel_bshd(tokenizer):
         assert set(shard.keys()) == required_keys, (
             f"CP rank {cp_rank}: expected keys {required_keys}, got {set(shard.keys())}"
         )
+
+
+def test_data_collator_for_context_parallel_with_tp(tokenizer):
+    """Test that DataCollatorForContextParallel duplicates batches for TP ranks when tp_world_size is set."""
+    cp_world_size = 2
+    tp_world_size = 2
+    divisibility_factor = 2 * cp_world_size
+
+    # Create the wrapped collator that produces padded THD batches
+    base_collator = DataCollatorWithFlattening(
+        collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=0.15),
+        pad_sequences_to_be_divisible_by=divisibility_factor,
+    )
+
+    # Create the context parallel collator with TP
+    cp_collator = DataCollatorForContextParallel(
+        collator=base_collator, device_mesh=_DummyCollatorMesh(cp_size=cp_world_size, tp_size=tp_world_size)
+    )
+
+    # Create test sequences
+    features = [
+        {"input_ids": [0, 5, 6, 7, 8, 9, 10, 2]},  # 8 tokens
+        {"input_ids": [0, 11, 12, 13, 14, 15, 16, 17, 2]},  # 9 tokens
+    ]
+
+    # Call the collator
+    result = cp_collator(features)
+
+    # Assert that the result list has length cp_world_size * tp_world_size
+    expected_length = cp_world_size * tp_world_size
+    assert len(result) == expected_length, f"Expected list of size {expected_length}, got {len(result)}"
+
+    # Assert that batches are duplicated for TP ranks
+    # The structure should be: [cp0_tp0, cp0_tp1, cp1_tp0, cp1_tp1]
+    # So consecutive pairs should be identical for the same CP rank
+    for cp_rank in range(cp_world_size):
+        base_idx = cp_rank * tp_world_size
+        for tp_rank in range(1, tp_world_size):
+            # Compare each TP rank's batch with the first TP rank's batch for this CP rank
+            first_batch = result[base_idx]
+            current_batch = result[base_idx + tp_rank]
+
+            # Check that all keys are the same
+            assert set(first_batch.keys()) == set(current_batch.keys()), (
+                f"CP rank {cp_rank}, TP rank {tp_rank}: keys don't match"
+            )
+
+            # Check that tensor values are identical
+            for key in first_batch.keys():
+                if isinstance(first_batch[key], torch.Tensor):
+                    torch.testing.assert_close(
+                        first_batch[key],
+                        current_batch[key],
+                        msg=f"CP rank {cp_rank}, TP rank {tp_rank}: '{key}' tensors don't match",
+                    )
+                else:
+                    assert first_batch[key] == current_batch[key], (
+                        f"CP rank {cp_rank}, TP rank {tp_rank}: '{key}' values don't match"
+                    )
+
+
+def test_data_collator_for_context_parallel_with_tp_first(tokenizer):
+    """Test that DataCollatorForContextParallel produces the correct interleaving when TP is the row dimension.
+
+    With tp_first=True (mesh_dim_names=("tp", "cp")), the flattened mesh is:
+    [(tp0,cp0), (tp0,cp1), (tp1,cp0), (tp1,cp1)]
+
+    So the collator output should be: [cp0, cp1, cp0, cp1] (CP shards interleaved).
+    Compare with the default (CP row-major): [cp0, cp0, cp1, cp1] (CP shards grouped).
+    """
+    cp_world_size = 2
+    tp_world_size = 2
+    divisibility_factor = 2 * cp_world_size
+
+    base_collator = DataCollatorWithFlattening(
+        collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
+        pad_sequences_to_be_divisible_by=divisibility_factor,
+    )
+
+    features = [
+        {"input_ids": [0, 5, 6, 7, 8, 9, 10, 2]},
+        {"input_ids": [0, 11, 12, 13, 14, 15, 16, 17, 2]},
+    ]
+
+    # CP row-major (default): output is [cp0, cp0, cp1, cp1]
+    cp_collator_cp_first = DataCollatorForContextParallel(
+        collator=base_collator,
+        device_mesh=_DummyCollatorMesh(cp_size=cp_world_size, tp_size=tp_world_size, tp_first=False),
+    )
+    result_cp_first = cp_collator_cp_first(features)
+
+    # TP row-major: output is [cp0, cp1, cp0, cp1]
+    cp_collator_tp_first = DataCollatorForContextParallel(
+        collator=base_collator,
+        device_mesh=_DummyCollatorMesh(cp_size=cp_world_size, tp_size=tp_world_size, tp_first=True),
+    )
+    result_tp_first = cp_collator_tp_first(features)
+
+    # Both should have the same total length
+    assert len(result_cp_first) == cp_world_size * tp_world_size
+    assert len(result_tp_first) == cp_world_size * tp_world_size
+
+    # CP row-major: [cp0, cp0, cp1, cp1] — consecutive pairs are identical
+    for key in result_cp_first[0]:
+        if isinstance(result_cp_first[0][key], torch.Tensor):
+            torch.testing.assert_close(result_cp_first[0][key], result_cp_first[1][key])
+            torch.testing.assert_close(result_cp_first[2][key], result_cp_first[3][key])
+
+    # TP row-major: [cp0, cp1, cp0, cp1] — alternating pairs are identical
+    for key in result_tp_first[0]:
+        if isinstance(result_tp_first[0][key], torch.Tensor):
+            torch.testing.assert_close(result_tp_first[0][key], result_tp_first[2][key])
+            torch.testing.assert_close(result_tp_first[1][key], result_tp_first[3][key])
+
+    # Verify the same CP shards exist in both orderings, just in different positions
+    # CP row-major shard at index 0 (cp0) should match TP row-major shard at index 0 (also cp0)
+    for key in result_cp_first[0]:
+        if isinstance(result_cp_first[0][key], torch.Tensor):
+            torch.testing.assert_close(result_cp_first[0][key], result_tp_first[0][key])
+            torch.testing.assert_close(result_cp_first[2][key], result_tp_first[1][key])

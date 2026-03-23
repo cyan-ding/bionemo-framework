@@ -109,7 +109,6 @@ def create_bshd_dataloader(
             non-streaming datasets.Dataset. Defaults to True.
         use_stateful_dataloader: Whether to use the StatefulDataLoader to enable checkpointing the dataloader state.
         mlm_probability: The probability of masking tokens for MLM (default 0.15). Set to 0 for no masking.
-        **kwargs: Unused, here to enable kwargs to match the signature of create_thd_dataloader.
 
     Returns:
         A dataloader that can be used for training.
@@ -148,7 +147,7 @@ def create_bshd_dataloader(
         batch_size=micro_batch_size,
         collate_fn=data_collator,
         num_workers=num_workers,
-        pin_memory=True if not use_stateful_dataloader else False,
+        pin_memory=not use_stateful_dataloader,
     )
 
     return train_dataloader, tokenized_dataset if sampler is None else sampler
@@ -225,7 +224,7 @@ def create_thd_dataloader(
         batch_size=None,  # The TokenPackingDataset will handle the batching.
         collate_fn=data_collator,
         num_workers=num_workers,
-        pin_memory=True if not use_stateful_dataloader else False,
+        pin_memory=not use_stateful_dataloader,
     )
     return train_dataloader, tokenized_dataset
 
@@ -257,7 +256,7 @@ def create_cp_dataloader(
 
         train_dataloader.collate_fn = DataCollatorForContextParallel(
             collator=train_dataloader.collate_fn,
-            cp_world_size=cp_mesh.size(),
+            device_mesh=cp_mesh,
         )
 
     else:

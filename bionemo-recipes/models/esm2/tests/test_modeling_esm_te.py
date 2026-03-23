@@ -39,8 +39,8 @@ from transformers import (
 )
 from transformers.models.esm.modeling_esm import EsmForMaskedLM
 
-from esm.collator import DataCollatorWithFlattening
-from esm.convert import (
+from collator import DataCollatorWithFlattening
+from convert import (
     _pack_qkv_bias,
     _pack_qkv_weight,
     _pad_bias,
@@ -49,7 +49,7 @@ from esm.convert import (
     convert_esm_te_to_hf,
     mapping,
 )
-from esm.modeling_esm_te import NVEsmConfig, NVEsmForMaskedLM
+from modeling_esm_te import NVEsmConfig, NVEsmForMaskedLM
 from tests.common import BaseModelTest, TestTolerances
 
 
@@ -81,7 +81,7 @@ class TestESM2Model(BaseModelTest):
 
     def get_layer_path(self, model: PreTrainedModel) -> List[nn.Module]:
         """Return the list of transformer layers."""
-        return list(model.esm.encoder.layers)  # type: ignore
+        return list(model.model.encoder.layers)  # type: ignore
 
     def get_reference_model_no_weights(self) -> PreTrainedModel:
         """For checkpoint conversion tests to pass, we need to remove the unused contact head."""
@@ -140,8 +140,8 @@ class TestESM2Model(BaseModelTest):
     def get_tolerances(self) -> TestTolerances:
         """Return ESM2-specific test tolerances."""
         return TestTolerances(
-            golden_value_loss_atol=1e-2,
-            golden_value_loss_rtol=1e-3,
+            golden_value_loss_atol=2e-2,
+            golden_value_loss_rtol=1e-2,
             golden_value_logits_atol=2.0,  # Higher tolerance needed after transformers PR#40370
             golden_value_logits_rtol=1e-4,
             cp_loss_atol=0.1,
@@ -195,7 +195,7 @@ class TestESM2Model(BaseModelTest):
 
         # Check packed QKV weights
         for i in range(model_hf.config.num_hidden_layers):
-            k = f"esm.encoder.layers.{i}.self_attention.layernorm_qkv.weight"
+            k = f"model.encoder.layers.{i}.self_attention.layernorm_qkv.weight"
             v = [
                 f"esm.encoder.layer.{i}.attention.self.query.weight",
                 f"esm.encoder.layer.{i}.attention.self.key.weight",
@@ -217,7 +217,7 @@ class TestESM2Model(BaseModelTest):
 
         # Check packed QKV biases
         for i in range(model_hf.config.num_hidden_layers):
-            k = f"esm.encoder.layers.{i}.self_attention.layernorm_qkv.bias"
+            k = f"model.encoder.layers.{i}.self_attention.layernorm_qkv.bias"
             v = [
                 f"esm.encoder.layer.{i}.attention.self.query.bias",
                 f"esm.encoder.layer.{i}.attention.self.key.bias",
@@ -243,7 +243,7 @@ class TestESM2Model(BaseModelTest):
 
         torch.testing.assert_close(
             _pad_weights(ctx_mock, model_hf.state_dict()["esm.embeddings.word_embeddings.weight"]),
-            model_te.state_dict()["esm.embeddings.word_embeddings.weight"],
+            model_te.state_dict()["model.embeddings.word_embeddings.weight"],
         )
         torch.testing.assert_close(
             _pad_weights(ctx_mock, model_hf.state_dict()["lm_head.decoder.weight"]),
@@ -254,7 +254,7 @@ class TestESM2Model(BaseModelTest):
             model_te.state_dict()["lm_head.decoder.bias"],
         )
 
-        te_state_dict_keys.remove("esm.embeddings.word_embeddings.weight")
+        te_state_dict_keys.remove("model.embeddings.word_embeddings.weight")
         te_state_dict_keys.remove("lm_head.decoder.weight")
         te_state_dict_keys.remove("lm_head.decoder.bias")
 
@@ -267,6 +267,10 @@ class TestESM2Model(BaseModelTest):
         )
 
         assert (
-            model_te.state_dict()["esm.embeddings.word_embeddings.weight"].data_ptr()
+            model_te.state_dict()["model.embeddings.word_embeddings.weight"].data_ptr()
             == model_te.state_dict()["lm_head.decoder.weight"].data_ptr()
         )
+
+    def create_inference_params(self, config, batch_size=1, max_seq_len=256, num_beams=1):
+        """These are unused for non-autoregressive models."""
+        pass

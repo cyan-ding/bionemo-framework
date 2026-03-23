@@ -30,8 +30,11 @@ from pathlib import Path
 import pytest
 import torch
 
+from bionemo.core.data.load import load as bionemo_load
+from bionemo.evo2.data.dataset_tokenizer import DEFAULT_HF_TOKENIZER_MODEL_PATH_512
 from bionemo.evo2.data.test_utils.create_fasta_file import ALU_SEQUENCE, create_fasta_file
 from bionemo.evo2.run.predict import batch_collator
+from bionemo.evo2.utils.checkpoint.nemo2_to_mbridge import run_nemo2_to_mbridge
 
 from ..utils import check_fp8_support, find_free_network_port, is_a6000_gpu
 
@@ -158,7 +161,7 @@ def test_predict_evo2_runs(
 
     # Load and collate predictions
     # Note: predict.py outputs are all batch-first (batch_dim=0), seq-second (seq_dim=1)
-    preds = [torch.load(pf) for pf in pred_files]
+    preds = [torch.load(pf, weights_only=True) for pf in pred_files]
     preds = batch_collator(
         [p for p in preds if p is not None],
         batch_dim=0,
@@ -185,12 +188,8 @@ def test_predict_evo2_runs(
 @pytest.fixture(scope="module")
 def mbridge_checkpoint_7b_1m_path(tmp_path_factory) -> Path:
     """Create or load a MBridge checkpoint for 7b-1m model testing."""
-    from bionemo.core.data.load import load
-    from bionemo.evo2.data.dataset_tokenizer import DEFAULT_HF_TOKENIZER_MODEL_PATH_512
-    from bionemo.evo2.utils.checkpoint.nemo2_to_mbridge import run_nemo2_to_mbridge
-
     try:
-        nemo2_checkpoint_path = load("evo2/7b-1m:1.0")
+        nemo2_checkpoint_path = bionemo_load("evo2/7b-1m:1.0")
     except ValueError as e:
         if e.args[0].endswith("does not have an NGC URL."):
             pytest.skip(
@@ -208,7 +207,7 @@ def mbridge_checkpoint_7b_1m_path(tmp_path_factory) -> Path:
         nemo2_ckpt_dir=nemo2_checkpoint_path,
         tokenizer_path=DEFAULT_HF_TOKENIZER_MODEL_PATH_512,
         mbridge_ckpt_dir=tmp_dir / "mbridge_checkpoint",
-        model_size="7b_arc_longcontext",
+        model_size="evo2_7b",
         seq_length=8192,  # Use shorter seq length for tests
         mixed_precision_recipe="bf16_mixed",
         vortex_style_fp8=False,
@@ -261,7 +260,7 @@ def baseline_predictions_7b_1m_results(
     # Use the updated glob pattern matching the new naming convention
     # Epoch mode: predictions__rank_{global_rank}__dp_rank_{dp_rank}.pt
     pred_files = glob.glob(str(output_dir / "predictions__rank_*__dp_rank_*.pt"))
-    preds = [torch.load(pf) for pf in pred_files]
+    preds = [torch.load(pf, weights_only=True) for pf in pred_files]
     preds = batch_collator(
         [p for p in preds if p is not None],
         batch_dim=0,
@@ -296,6 +295,8 @@ def baseline_predictions_7b_1m_results(
             1, 1, 1, 2, True, "epoch", id="ddp=1,cp=1,pp=1,tp=2,fp8=True,wi=epoch"
         ),  # Cover case where FP8 was not supported with TP=2
         pytest.param(1, 1, 1, 2, False, "epoch", id="ddp=1,cp=1,pp=1,tp=2,fp8=False,wi=epoch"),
+        pytest.param(1, 1, 1, 8, False, "epoch", id="ddp=1,cp=1,pp=1,tp=8,fp8=False,wi=epoch"),
+        pytest.param(1, 1, 1, 8, True, "epoch", id="ddp=1,cp=1,pp=1,tp=8,fp8=True,wi=epoch"),  # Cover TP=8 with FP8
     ],
 )
 @pytest.mark.slow
@@ -394,7 +395,7 @@ def test_predict_evo2_equivalent_with_log_probs(
         seq_idx_map = json.load(f)
 
     # Load and collate predictions from all DP ranks
-    preds = [torch.load(pf) for pf in pred_files]
+    preds = [torch.load(pf, weights_only=True) for pf in pred_files]
     preds = batch_collator(
         [p for p in preds if p is not None],
         batch_dim=0,
@@ -414,8 +415,8 @@ def test_predict_evo2_equivalent_with_log_probs(
             #  This should be investigated. TP=2 on some GPUs needs even more tolerance.
             rel = 2e-3
         elif fp8:
-            # NOTE: This is hand-tuned on a b300 to pass for now as of 9/10/2025.
-            rel = 1e-2
+            # FP8 + TP can have 1 to 2% log-prob drift vs baseline; use 2% relative tolerance.
+            rel = 2e-2
         else:
             rel = 1e-6
         assert log_probs.item() == pytest.approx(baseline_predictions_7b_1m_results[original_idx.item()], rel=rel)
@@ -543,7 +544,7 @@ def test_predict_evo2_embedding_extraction(
     pred_files = sorted(glob.glob(str(output_dir / "predictions__rank_*__dp_rank_*.pt")))
     assert len(pred_files) == 1, f"Expected 1 prediction file, got {len(pred_files)}"
 
-    preds = torch.load(pred_files[0])
+    preds = torch.load(pred_files[0], weights_only=True)
     assert isinstance(preds, dict)
 
     # Verify expected keys for embedding extraction

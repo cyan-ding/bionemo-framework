@@ -15,18 +15,24 @@
 
 import os
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+# When launched via torchrun, conftest.py sys.path setup doesn't run.
+# Ensure the model directory (parent of tests/) is on sys.path for bare module imports.
+sys.path.insert(0, Path(__file__).resolve().parent.parent.as_posix())
 
 import pytest
 import torch
 from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoModelForMaskedLM, AutoTokenizer, DataCollatorForLanguageModeling
 
-from esm.collator import _split_batch_by_cp_rank
-from esm.convert import convert_esm_hf_to_te
-from esm.modeling_esm_te import NVEsmForMaskedLM
+from collator import _split_batch_by_cp_rank
+from convert import convert_esm_hf_to_te
+from modeling_esm_te import NVEsmForMaskedLM
 
 
 requires_multi_gpu = pytest.mark.skipif(
@@ -203,8 +209,8 @@ if __name__ == "__main__":
 
         # Sample gradients from a few layers for comparison
         sample_layers = [
-            model.esm.encoder.layers[0].self_attention.core_attention,
-            model.esm.encoder.layers[0].self_attention.layernorm_qkv,
+            model.model.encoder.layers[0].self_attention.core_attention,
+            model.model.encoder.layers[0].self_attention.layernorm_qkv,
         ]
 
         # Now grab the gradients from the sample layers
@@ -256,7 +262,7 @@ if __name__ == "__main__":
         cp_world_size = torch.distributed.get_world_size(group=cp_group)
 
         # Set up context parallelism for each layer
-        for i, transformer_layer in enumerate(model.module.esm.encoder.layers):
+        for i, transformer_layer in enumerate(model.module.model.encoder.layers):
             transformer_layer.set_context_parallel_group(
                 cp_group, torch.distributed.get_process_group_ranks(device_mesh["cp"].get_group()), torch.cuda.Stream()
             )
@@ -341,8 +347,8 @@ if __name__ == "__main__":
         # Capture gradients from the same layers in the CP model
         # Note: DDP wraps the model with 'module.' prefix
         sample_layers_cp = [
-            model.module.esm.encoder.layers[0].self_attention.core_attention,
-            model.module.esm.encoder.layers[0].self_attention.layernorm_qkv,
+            model.module.model.encoder.layers[0].self_attention.core_attention,
+            model.module.model.encoder.layers[0].self_attention.layernorm_qkv,
         ]
 
         gradients_cp = {}

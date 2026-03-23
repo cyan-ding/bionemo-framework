@@ -68,6 +68,103 @@ Training recipes are available in the `bionemo-recipes/recipes/` directory:
   loop.
 - **[esm2_accelerate_te](../../recipes/esm2_accelerate_te/)** - Trains the model using HuggingFace
   [Accelerate](https://huggingface.co/docs/accelerate/index).
+- **[vllm_inference/esm2](../../recipes/vllm_inference/esm2/)** - Demonstrates inference with
+  [vLLM](https://github.com/vllm-project/vllm).
+
+## Running with Low Precision (FP8/FP4)
+
+The TE-optimized ESM-2 model supports per-layer quantization via two mechanisms: a **config-level**
+`layer_precision` list that declares which layers use which precision, and **constructor-level** recipe
+objects (`fp8_recipe`, `fp4_recipe`) that control the quantization behaviour.
+
+### Configuration: `layer_precision`
+
+`NVEsmConfig.layer_precision` is a list of length `num_hidden_layers` where each element is `"fp8"`,
+`"fp4"`, or `None` (BF16 fallback). When set, it controls the `te.autocast` context used for each
+transformer layer during both initialization and forward pass.
+
+```python
+from modeling_esm_te import NVEsmConfig, NVEsmForMaskedLM
+
+# All layers in FP8
+config = NVEsmConfig.from_pretrained(
+    "nvidia/esm2_t6_8M_UR50D",
+    layer_precision=["fp8"] * 6,
+)
+```
+
+If you pass an `fp8_recipe` to the model constructor **without** setting `layer_precision`, it
+defaults to `["fp8"] * num_hidden_layers` (all layers FP8). You can also mix precisions, for example
+running most layers in FP8 but keeping the first and last layers in BF16:
+
+```python
+layer_precision = [None] + ["fp8"] * 4 + [None]
+config = NVEsmConfig.from_pretrained(
+    "nvidia/esm2_t6_8M_UR50D",
+    layer_precision=layer_precision,
+)
+```
+
+### Constructor arguments: `fp8_recipe` and `fp4_recipe`
+
+The model classes (`NVEsmModel`, `NVEsmForMaskedLM`, `NVEsmForTokenClassification`) accept
+`fp8_recipe` and `fp4_recipe` keyword arguments. These are `transformer_engine.common.recipe.Recipe`
+objects that configure the quantization algorithm (e.g., delayed scaling, block scaling, MXFP8).
+
+```python
+import transformer_engine.common.recipe as te_recipe
+
+from modeling_esm_te import NVEsmConfig, NVEsmForMaskedLM
+
+fp8_recipe = te_recipe.DelayedScaling()
+
+config = NVEsmConfig.from_pretrained(
+    "nvidia/esm2_t6_8M_UR50D",
+    layer_precision=["fp8"] * 6,
+)
+model = NVEsmForMaskedLM(config, fp8_recipe=fp8_recipe)
+```
+
+For FP4 (NVFP4) quantization, pass an `fp4_recipe` instead and set the corresponding layers to
+`"fp4"` in `layer_precision`:
+
+```python
+fp4_recipe = te_recipe.NVFP4BlockScaling()
+
+config = NVEsmConfig.from_pretrained(
+    "nvidia/esm2_t6_8M_UR50D",
+    layer_precision=["fp4"] * 6,
+)
+model = NVEsmForMaskedLM(config, fp4_recipe=fp4_recipe)
+```
+
+You can also mix FP8 and FP4 layers by providing both recipes and a mixed `layer_precision` list.
+
+### Quantized model initialization: `use_quantized_model_init`
+
+When `use_quantized_model_init=True` is set in the config, layers are created inside a
+`te.quantized_model_init` context. This tells TransformerEngine to initialize weights directly in
+the target quantized format, avoiding a separate quantization step after initialization.
+
+```python
+config = NVEsmConfig.from_pretrained(
+    "nvidia/esm2_t6_8M_UR50D",
+    layer_precision=["fp4"] * 6,
+    use_quantized_model_init=True,
+)
+model = NVEsmForMaskedLM(config, fp4_recipe=te_recipe.NVFP4BlockScaling())
+```
+
+### Notes
+
+- The `lm_head` (and `dense` projection in `NVEsmLMHead`) always runs in higher precision
+  (`te.autocast(enabled=False)`) regardless of `layer_precision`, to avoid numerical instability in
+  the output logits.
+- FP8 requires compute capability 9.0+ (Hopper). MXFP8 requires compute capability 10.0+
+  (Blackwell).
+- If an `fp8_recipe` is provided without `layer_precision`, all layers default to FP8. Providing
+  both `fp8_recipe` and `fp4_recipe` without `layer_precision` raises a `RuntimeError`.
+- An FP4 layer **requires** an `fp4_recipe`; omitting it raises a `RuntimeError`.
 
 ## Converting Between Model Formats
 
@@ -80,7 +177,7 @@ Hugging Face Transformers format for sharing and deployment. The workflow involv
 ```python
 from transformers import AutoModelForMaskedLM
 
-from esm.convert import convert_esm_hf_to_te
+from convert import convert_esm_hf_to_te
 
 hf_model = AutoModelForMaskedLM.from_pretrained("facebook/esm2_t6_8M_UR50D")
 te_model = convert_esm_hf_to_te(hf_model)
@@ -92,8 +189,8 @@ This loads the pre-trained ESM2 model that will serve as our reference for compa
 ### Converting from TE back to HF Transformers
 
 ```python
-from esm.convert import convert_esm_te_to_hf
-from esm.modeling_esm_te import NVEsmForMaskedLM
+from convert import convert_esm_te_to_hf
+from modeling_esm_te import NVEsmForMaskedLM
 
 te_model = NVEsmForMaskedLM.from_pretrained("/path/to/te_checkpoint")
 hf_model = convert_esm_te_to_hf(te_model)
@@ -115,7 +212,7 @@ tokenizer = AutoTokenizer.from_pretrained("facebook/esm2_t6_8M_UR50D")
 
 To validate the converted models, refer to the commands in [Inference Examples](#inference-examples) above to load and test both the original and converted
 models to ensure loss and logit values are similar. Additionally, refer to the golden value tests in
-[test_modeling_esm_te.py](tests/test_modeling_esm_te.py) and [test_convert.py](tests/test_convert.py).
+[test_modeling_esm_te.py](tests/test_modeling_esm_te.py) and [test_export.py](tests/test_export.py).
 
 ## Developer Guide
 
@@ -130,8 +227,8 @@ To run tests locally, run `recipes_local_test.py` from the repository root with 
 ### Development container
 
 To use the provided devcontainer, use "Dev Containers: Reopen in Container" from the VSCode menu, and choose the
-"BioNeMo Recipes Dev Container" option. To run the tests inside the container, first install the model package in
-editable mode with `pip install -e .`, then run `pytest -v .` in the model directory.
+"BioNeMo Recipes Dev Container" option. To run the tests inside the container, first install the dependencies with
+`pip install -r requirements.txt`, then run `pytest -v .` in the model directory.
 
 ### Deploying converted checkpoints to HuggingFace Hub
 
