@@ -51,7 +51,21 @@ def parse_args():
         "--prompt",
         type=str,
         default=default_prompt,
-        help="Prompt to generate text from Evo2. Defaults to a phylogenetic lineage tag for E coli.",
+        help="Prompt to generate text from Evo2. Defaults to a phylogenetic lineage tag for E coli. "
+        "Ignored when --prompts-file is set.",
+    )
+    ap.add_argument(
+        "--prompts-file",
+        type=str,
+        default=None,
+        help="Path to a file with one prompt per line. Loads the model once and runs each prompt in order. "
+        "Requires --output-files-file; optional --seed-offsets (one integer per prompt, comma-separated).",
+    )
+    ap.add_argument(
+        "--output-files-file",
+        type=str,
+        default=None,
+        help="Path to a file with one output filename per line, aligned with --prompts-file.",
     )
     ap.add_argument(
         "--ckpt-dir", type=str, required=True, help="Path to checkpoint directory containing pre-trained Evo2 model."
@@ -61,6 +75,13 @@ def parse_args():
     ap.add_argument("--top-p", type=float, default=0.0, help="Top P during sampling for generation.")
     ap.add_argument("--max-new-tokens", type=int, default=1024, help="Maximum number of tokens to generate.")
     ap.add_argument("--seed", type=int, default=None, help="Random seed for generation.")
+    ap.add_argument(
+        "--seed-offsets",
+        type=str,
+        default=None,
+        help="Comma-separated integer offsets, one per line in --prompts-file. "
+        "Run j (1..num-runs) for prompt i uses seed = --seed + offset_i + j. Ignored without --prompts-file.",
+    )
     ap.add_argument(
         "--num-runs",
         type=int,
@@ -106,7 +127,9 @@ def parse_args():
 
 
 def infer(
-    prompt: str,
+    prompts: list[str],
+    output_files: list[Optional[str]],
+    seed_offsets: list[int],
     ckpt_dir: str,
     temperature: float,
     top_k: int,
@@ -115,7 +138,6 @@ def infer(
     tensor_parallel_size: int,
     pipeline_model_parallel_size: int,
     context_parallel_size: int,
-    output_file: Optional[str] = None,
     ckpt_format: CheckpointFormats = "torch_dist",
     seed: Optional[int] = None,
     num_runs: int = 1,
@@ -126,7 +148,11 @@ def infer(
     """Inference workflow for Evo2.
 
     Args:
-        prompt (str): Prompt to generate text from Evo2.
+        prompts (list[str]): One or more prompts; model and tokenizer are loaded once.
+        output_files (list[Optional[str]]): Output JSONL path per prompt, or None to log only.
+        seed_offsets (list[int]): Per-prompt seed offsets. With multiple prompts and ``seed`` set, run ``j``
+            (1-based, ``j`` in ``1..num_runs``) uses ``seed + seed_offsets[i] + j``. Single-prompt mode uses
+            ``seed`` unchanged for every run.
         ckpt_dir (str): Path to checkpoint directory containing pre-trained Evo2 model.
         temperature (float): Temperature during sampling for generation.
         top_k (int): Top K during sampling for generation.
@@ -135,16 +161,22 @@ def infer(
         tensor_parallel_size (int): Order of tensor parallelism.
         pipeline_model_parallel_size (int): Order of pipeline parallelism.
         context_parallel_size (int): Order of context parallelism.
-        output_file (str): Output file containing the generated text produced by the Evo2 model.
         ckpt_format (CheckpointFormats): Checkpoint format to use.
+        num_runs (int): Number of generations per prompt (model stays loaded).
         seed (int): Random seed for generation.
         vortex_style_fp8 (bool): Whether to use vortex style FP8.
         flash_decode (bool): Whether to use flash decode.
         return_log_probs (bool): Whether to return log probabilities.
 
     Returns:
-        None
+        list[InferenceRequest]: All inference results in order.
     """
+    if len(prompts) != len(output_files) or len(prompts) != len(seed_offsets):
+        raise ValueError(
+            f"prompts ({len(prompts)}), output_files ({len(output_files)}), and seed_offsets "
+            f"({len(seed_offsets)}) must have the same length."
+        )
+    multi_prompt = len(prompts) > 1
     model_parallel_size = tensor_parallel_size * pipeline_model_parallel_size * context_parallel_size
     if model_parallel_size > torch.cuda.device_count():
         raise ValueError(
@@ -189,64 +221,104 @@ def infer(
     )
 
     all_results: list[InferenceRequest] = []
-    for run_idx in range(num_runs):
-        run_seed = seed if seed is not None else None
-        t0 = time.perf_counter_ns()
-        # TODO: fix return type in NeMo inference.generate (it is a list[InferenceRequest] not a dict)
-        results: list[InferenceRequest] = inference.generate(
-            model=inference_wrapped_model,
-            max_batch_size=1,  # vortex only supports batch size 1
-            tokenizer=mcore_tokenizer,
-            prompts=[prompt],
-            random_seed=run_seed,
-            inference_params=CommonInferenceParams(
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                return_log_probs=return_log_probs,
-                num_tokens_to_generate=max_new_tokens,
-            ),
-        )
-        dt = (time.perf_counter_ns() - t0) / 1e9  # seconds
-        tokens_per_sec = (len(results[0].generated_text) + 1) / dt  # +1 for the prompt
-
-        print(
-            f"Run {run_idx + 1}/{num_runs}: {dt:.2f}s, {tokens_per_sec:.1f} tokens/sec",
-            file=sys.stderr,
-        )
-        if torch.distributed.get_rank() == 0:
-            if output_file is None:
-                logging.info(results)
+    for prompt_idx, prompt in enumerate(prompts):
+        output_file = output_files[prompt_idx]
+        offset = seed_offsets[prompt_idx]
+        for run_idx in range(num_runs):
+            if multi_prompt:
+                run_seed = seed + offset + (run_idx + 1) if seed is not None else None
             else:
-                import json
+                run_seed = seed if seed is not None else None
+            t0 = time.perf_counter_ns()
+            # TODO: fix return type in NeMo inference.generate (it is a list[InferenceRequest] not a dict)
+            results: list[InferenceRequest] = inference.generate(
+                model=inference_wrapped_model,
+                max_batch_size=1,  # vortex only supports batch size 1
+                tokenizer=mcore_tokenizer,
+                prompts=[prompt],
+                random_seed=run_seed,
+                inference_params=CommonInferenceParams(
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    return_log_probs=return_log_probs,
+                    num_tokens_to_generate=max_new_tokens,
+                ),
+            )
+            dt = (time.perf_counter_ns() - t0) / 1e9  # seconds
+            tokens_per_sec = (len(results[0].generated_text) + 1) / dt  # +1 for the prompt
 
-                # jsonl, one entry per line
-                data = {
-                    "request_id": results[0].request_id,
-                    "run": run_idx + 1,
-                    "prompt": results[0].prompt,
-                    "generated_text": results[0].generated_text,
-                    "status": results[0].status.name if results[0].status else None,
-                    "num_tokens_to_generate": (
-                        results[0].sampling_params.num_tokens_to_generate
-                        if results[0].sampling_params
-                        else None
-                    ),
-                }
-                with open(output_file, "a") as f:
-                    json.dump(data, f)
-                    f.write("\n")
-        all_results.extend(results)
+            label = f"prompt {prompt_idx + 1}/{len(prompts)}" if multi_prompt else "run"
+            print(
+                f"{label} run {run_idx + 1}/{num_runs}: {dt:.2f}s, {tokens_per_sec:.1f} tokens/sec",
+                file=sys.stderr,
+            )
+            if torch.distributed.get_rank() == 0:
+                if output_file is None:
+                    logging.info(results)
+                else:
+                    import json
+
+                    # jsonl, one entry per line
+                    data = {
+                        "request_id": results[0].request_id,
+                        "run": run_idx + 1,
+                        "prompt": results[0].prompt,
+                        "generated_text": results[0].generated_text,
+                        "status": results[0].status.name if results[0].status else None,
+                        "num_tokens_to_generate": (
+                            results[0].sampling_params.num_tokens_to_generate
+                            if results[0].sampling_params
+                            else None
+                        ),
+                    }
+                    with open(output_file, "a") as f:
+                        json.dump(data, f)
+                        f.write("\n")
+            all_results.extend(results)
 
     return all_results
 
 
+def _read_nonempty_lines(path: str) -> list[str]:
+    """Read stripped non-empty lines from a text file."""
+    with open(path, encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+
 def main():
     """Main function for Evo2 inference."""
-    # Parse args.
     args = parse_args()
+
+    if args.prompts_file is not None:
+        if not args.output_files_file:
+            raise ValueError("--prompts-file requires --output-files-file.")
+        prompts = _read_nonempty_lines(args.prompts_file)
+        output_files = _read_nonempty_lines(args.output_files_file)
+        if len(prompts) != len(output_files):
+            raise ValueError(
+                f"--prompts-file ({len(prompts)} lines) and --output-files-file ({len(output_files)} lines) "
+                "must have the same number of non-empty lines."
+            )
+        if args.seed_offsets is None:
+            seed_offsets = [0] * len(prompts)
+        else:
+            parts = [p.strip() for p in args.seed_offsets.split(",") if p.strip()]
+            seed_offsets = [int(p) for p in parts]
+            if len(seed_offsets) != len(prompts):
+                raise ValueError(
+                    f"--seed-offsets must have {len(prompts)} comma-separated integers (one per prompt), "
+                    f"got {len(seed_offsets)}."
+                )
+    else:
+        prompts = [args.prompt]
+        output_files = [args.output_file]
+        seed_offsets = [0]
+
     infer(
-        prompt=args.prompt,
+        prompts=prompts,
+        output_files=output_files,
+        seed_offsets=seed_offsets,
         ckpt_dir=args.ckpt_dir,
         temperature=args.temperature,
         top_k=args.top_k,
@@ -255,7 +327,6 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
         context_parallel_size=args.context_parallel_size,
-        output_file=args.output_file,
         ckpt_format=args.ckpt_format,
         seed=args.seed,
         num_runs=args.num_runs,
