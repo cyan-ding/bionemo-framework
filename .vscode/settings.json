@@ -26,6 +26,5 @@
     "editor.rulers": [
         120
     ],
-    "autoDocstring.docstringFormat": "google-notypes",
-    "search.exclude": { "**/logs/**": true },
+    "autoDocstring.docstringFormat": "google-notypes"
 }

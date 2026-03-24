@@ -16,9 +16,9 @@ bionemo-framework repository. You can download a zipped directory of this folder
 
 ## Supported Models and Training Features
 
-| Model                                    | BF16 | FP8<sup>[1]</sup> | THD Input Format | FP8 with THD Input Format | MXFP8<sup>[2]</sup> | Context Parallelism | Tensor Parallelism |
-| ---------------------------------------- | ---- | ----------------- | ---------------- | ------------------------- | ------------------- | ------------------- | ------------------ |
-| [Llama 3](../../models/llama3/README.md) | ✅   | ✅                | ✅               | ✅                        | ✅                  | ✅                  | 🚧                 |
+| Model                                    | BF16 | FP8<sup>[1]</sup> | THD Input Format | FP8 with THD Input Format | MXFP8<sup>[2]</sup> | Context Parallelism |
+| ---------------------------------------- | ---- | ----------------- | ---------------- | ------------------------- | ------------------- | ------------------- |
+| [Llama 3](../../models/llama3/README.md) | ✅   | ✅                | ✅               | 🚧                        | 🚧                  | 🚧                  |
 
 ✅: Supported <br/>
 🚧: Under development <br/>
@@ -42,36 +42,16 @@ To run the container, run:
 docker run -it --gpus all --network host --ipc=host --rm -v ${PWD}:/workspace/bionemo llama3_native_te /bin/bash
 ```
 
-Alternatively, the dependencies can be installed manually in an environment with CUDA support. See `requirements.txt`
-for the list of dependencies.
+Alternatively, the dependencies can be installed manually in an environment with CUDA support. See `requirements.txt` for the list of dependencies.
 
 ### Performance Benchmarks
-
-<p align="center">
-  <img src="../../../docs/docs/assets/images/recipes/70b-cp-benchmarks.png" alt="Llama 3 Context Parallelism Benchmarks" width="100%" />
-</p>
-
-Scaling Llama 3 70B with Context Parallelism (CP) on 32x NVIDIA GB300 GPUs (NVL32) with synthetic data of increasing
-sequence length. MFU was calculated using a 2.5 PFLOPS/GPU maximum theoretical bf16 throughput, with model FLOPS
-calculated with the formula
-
-```python
-def compute_model_pflops(seq_len, global_batch_size, step_time_s):
-    B, S, H, L, V = global_batch_size, seq_len, HIDDEN_DIM, N_LAYERS, VOCAB_SIZE
-    model_flops = (
-        (24 * B * S * H * H + 4 * B * S * S * H) * (3 * L) + (6 * B * S * H * V)
-    ) / step_time_s
-    return model_flops / 1e15
-```
-
-### Convergence Benchmarks
 
 <p align="center">
   <img src="../../../docs/docs/assets/images/recipes/lingua-1b-loss-curve.png" alt="Llama 3 Lingua 1B Loss Curve" width="49%" />
   <img src="../../../docs/docs/assets/images/recipes/lingua-1b-step-time.png" alt="Llama 3 Lingua 1B Step Time" width="49%" />
 </p>
 
-We compared the convergence of this Llama3 recipe (with FSDP2) against NeMo 2.0
+We compared the performance and convergence of this Llama3 recipe (with FSDP2) against NeMo 2.0
 (https://github.com/NVIDIA-NeMo/NeMo) and the [facebookresearch/lingua](https://github.com/facebookresearch/lingua)
 implementation on the DCLM Baseline 1.0 dataset. See [Training on Natural Language Data (Lingua
 Reproduction)](#lingua-reproduction) for more details. The figure above shows similar loss convergence and step time to
@@ -90,11 +70,10 @@ Training was performed with BF16 precision.
 
 ### Distributed Training
 
-This recipe supports distributed training using DDP, FSDP2, and FSDP2 with Context Parallelism, shown in three separate training entrypoints:
+This recipe supports distributed training using DDP and FSDP2, shown in two separate training entrypoints:
 
 - [Distributed Data Parallel (DDP)](https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html), shown in `train_ddp.py`
 - [Fully Sharded Data Parallel 2 (FSDP2)](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html), shown in `train_fsdp2.py`
-- FSDP2 with Context Parallelism, shown in `train_fsdp2_cp.py`
 
 ## Commands to Launch Training
 
@@ -112,21 +91,6 @@ torchrun --nproc_per_node=2 train_fsdp2.py  # or train_ddp.py
 
 Multi-Node training is supported with both strategies.
 
-A convergence test configuration (`L0_convergence`) is also available, which uses a tiny Llama model
-to verify that the training loop can overfit on a small dataset:
-
-```bash
-python train_fsdp2.py --config-name L0_convergence
-```
-
-Gradient accumulation is supported with both strategies. To enable gradient accumulation, set `grad_acc_steps` to the
-number of steps to accumulate gradients before updating the model parameters. This is useful to scale the effective
-batch size while running on a smaller number of GPUs.
-
-```bash
-python train_fsdp2.py --config-name L0_sanity grad_acc_steps=2
-```
-
 ### FP8 Training
 
 To run training with FP8, enable it by overriding the `fp8_config.enabled=true` configuration parameter. Additional FP8
@@ -136,33 +100,21 @@ configuration parameters, including switching to `MXFP8BlockScaling`, can be set
 python train_fsdp2.py --config-name L0_sanity fp8_config.enabled=true
 ```
 
-#### Quantized Model Initialization
-
-When training with FP8, you can initialize model weights directly in the target quantized format by setting
-`config_kwargs.use_quantized_model_init=true`. This tells TransformerEngine to create weights inside a
-`te.quantized_model_init` context, avoiding a separate quantization step after initialization.
-
-```bash
-python train_fsdp2.py --config-name L0_sanity \
-  fp8_config.enabled=true \
-  +config_kwargs.use_quantized_model_init=true
-```
-
 #### FP8 Debugging
 
 We also provide a mechanism to receive tensor data related to FP8 layers during training which may include activations, weights and gradients.
 
 To enable this please select the following config options.
 
-```bash
+```python
 python train_fsdp2.py \
-  fp8_stats_config.enabled=True \
-  fp8_stats_config.fp8_log_dir=./logs/fp8_stats_logs_dummy \
-  fp8_stats_config.fp8_stats_file=./fp8_debugging_stats.yaml \
-  fp8_config.enabled=True
+fp8_stats_config.enabled=True # whether to log stats or not
+fp8_stats_config.fp8_log_dir=./logs/fp8_stats_logs_dummy # where to store the logs
+fp8_stats_config.fp8_stats_file=./fp8_debugging_stats.yaml # specifies what stats you want to run. Currently this is saved in this yaml file.
+fp8_config.enabled=True # set this to use FP8 otherwise stats logging wont work
 ```
 
-Note: This feature is available for the `train_ddp` and the `train_fsdp2` scripts.
+Note: This feature is available for the `train_ddp` and the `train_fsdp2` scripts. It is not yet available for `train_mfsdp`.
 
 The config file structure [fp8_debugging_stats.yaml](fp8_debugging_stats.yaml) is explained in the [NVIDIA Transformer Engine config file documentation](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/debug/2_config_file_structure.html) in more detail. Below we will cover some very basic elements of the file structure.
 
@@ -188,16 +140,6 @@ collator will automatically pad packed sequences to the maximum number of tokens
 python train_fsdp2.py --config-name L0_sanity \
   fp8_config.enabled=true \
   use_sequence_packing=true
-```
-
-### Context Parallel Training
-
-Context parallelism splits each sequence across multiple GPUs along the sequence dimension, enabling training with very
-long sequences. Use `train_fsdp2_cp.py` with the `L0_sanity_cp` configuration and set `cp_size` to the number of context
-parallelism ranks. Works with both BSHD (no padding) and THD (padding) input formats. Only TE models are supported.
-
-```bash
-torchrun --nproc_per_node=4 train_fsdp2_cp.py --config-name L0_sanity_cp cp_size=2
 ```
 
 ## Downloading Pre-Training Data For Offline Training
@@ -267,66 +209,6 @@ directory within the checkpoint directory.
 These examples show how to save and resume your dataloader by passing the dataloader instance to our `save_checkpoint_*`
 and `load_checkpoint_*` functions using the `StatefulDataLoader` class from `torchdata`. See `checkpoint.py` for
 implementation details.
-
-## Performance Profiling with NVIDIA Nsight Systems
-
-This recipe includes built-in support for profiling with NVIDIA Nsight Systems, which provides detailed performance
-traces including CUDA kernels, CPU activities, memory operations, and NVTX ranges. The profiler allows you to specify
-the exact training step range to profile.
-
-### Basic Usage (Single GPU)
-
-To profile a training run on a single GPU:
-
-```bash
-nsys profile \
-  -o nsight_trace \
-  --trace=cuda,nvtx,osrt,cudnn,cublas \
-  --pytorch=autograd-nvtx \
-  --capture-range=cudaProfilerApi \
-  --capture-range-end=stop \
-  python train_fsdp2.py \
-    profiler.enabled=true \
-    profiler.start_step=10 \
-    profiler.end_step=15
-```
-
-**Profiler Configuration Parameters:**
-
-- `profiler.enabled`: Enable/disable profiling (default: false)
-- `profiler.start_step`: Training step at which to start profiling (default: 10)
-- `profiler.end_step`: Training step at which to end profiling (default: 15)
-
-**Nsight Systems Flags:**
-
-- `--pytorch=autograd-nvtx`: Adds NVTX markers for PyTorch autograd operations (forward/backward passes, optimizer steps). This helps visualize the training loop structure and identify bottlenecks in the computation graph.
-- `--pytorch-backtrace=cuda`: Captures Python backtraces for CUDA kernel launches, helping identify which Python code triggered each kernel. This is invaluable for debugging performance issues and understanding which operations are expensive.
-- `--python-sampling=true` (optional): Periodically samples Python call stacks to identify CPU-side bottlenecks. Useful when investigating data loading, preprocessing, or Python overhead. Adds ~5-15% overhead, so only use when needed.
-
-**Note**: The PyTorch-specific flags (`--pytorch=autograd-nvtx` and `--pytorch-backtrace=cuda`) add minimal overhead but provide significantly more detailed insights into PyTorch operations, making them highly recommended for training workload profiling. Use `--python-sampling=true` only when investigating CPU/Python performance.
-
-The profiler will start capturing performance data at `start_step` and stop at `end_step`. It's recommended to start profiling after a few steps to allow training to stabilize.
-
-### Multi-GPU Profiling
-
-For distributed training, **profiling is only performed on global rank 0** to minimize overhead and avoid redundant data
-collection. Other ranks will skip profiling automatically.
-
-#### Multi-GPU on Single Node
-
-```bash
-nsys profile \
-  -o nsight_trace_rank0 \
-  --trace=cuda,nvtx,osrt,cudnn,cublas \
-  --pytorch=autograd-nvtx \
-  --pytorch-backtrace=cuda \
-  --capture-range=cudaProfilerApi \
-  --capture-range-end=stop \
-  torchrun --nproc_per_node=2 train_fsdp2.py \
-    profiler.enabled=true
-```
-
-For more information on Nsight Systems, see the [official documentation](https://docs.nvidia.com/nsight-systems/).
 
 ## Running Inference with the Trained Model
 

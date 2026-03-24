@@ -13,27 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# --- BEGIN COPIED FILE NOTICE ---
-# This file is copied from: bionemo-recipes/models/esm2/state.py
-# Do not modify this file directly. Instead, modify the source and run:
-#     python ci/scripts/check_copied_files.py --fix
-# --- END COPIED FILE NOTICE ---
-
-"""State dict conversion utilities adapted from nemo.lightning.io.state.
-
-This module provides the transform system used by convert.py to map state dicts between model formats:
-
-- ``mapping``: A dict of simple key renames (source_key -> target_key). Each source key is copied directly
-  to the corresponding target key with no modification to the tensor values.
-
-- ``transforms``: A list of ``StateDictTransform`` objects for multi-key merges and splits. These handle
-  cases where multiple source keys must be combined into one target key (e.g., merging Q/K/V into fused QKV),
-  or one source key must be split into multiple target keys.
-
-  Important: When ``source_key`` is a tuple (many-to-one merge), the transform function's parameter names
-  are used to map each source key to a function argument. This means ``*args`` style parameters do not work;
-  each parameter must be explicitly named (e.g., ``def fn(q, k, v)`` not ``def fn(*args)``).
-"""
+"""State dict conversion utilities adapted from nemo.lightning.io.state."""
 
 import inspect
 import logging
@@ -87,8 +67,8 @@ def apply_transforms(
     source: Union[nn.Module, _ModelState],
     target: TargetModuleT,
     mapping: Dict[str, str],
-    transforms: Optional[List[Callable[[TransformCTX], TransformCTX]]] = None,
-    state_dict_ignored_entries: Optional[List] = None,
+    transforms: Optional[List[Callable[[TransformCTX], TransformCTX]]] = [],
+    state_dict_ignored_entries: List = [],
     cast_dtype: Optional[torch.dtype] = None,
 ) -> TargetModuleT:
     """Transform the state dictionary of a source module to match the structure of a target module's state dictionary.
@@ -146,11 +126,6 @@ def apply_transforms(
         This function is particularly useful when adapting models from different frameworks or
         when consolidating models with different architectural changes.
     """
-    if transforms is None:
-        transforms = []
-    if state_dict_ignored_entries is None:
-        state_dict_ignored_entries = []
-
     # Track dtypes to make sure they weren't modified during conversion.
     target_orig_dtypes = extract_dtypes(target.named_parameters())
 
@@ -343,7 +318,7 @@ class StateDictTransform(Generic[F]):
                     try:
                         source_match = source_matches[target_index]
                     except IndexError as e:
-                        logger.error(f"Encountered IndexError during transform.\n{source_matches=}\n{target_matches=}")
+                        logger.error(f"Enountered IndexError during transform.\n{source_matches=}\n{target_matches=}")
                         raise e
                     if accepts_var_args:
                         source_values = [source_dict[k] for k in source_match]

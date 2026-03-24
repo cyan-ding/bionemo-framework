@@ -200,7 +200,7 @@ def create_bshd_dataloader(
         batch_size=micro_batch_size,
         collate_fn=data_collator,
         num_workers=num_workers,
-        pin_memory=not use_stateful_dataloader,
+        pin_memory=True if not use_stateful_dataloader else False,
         persistent_workers=num_workers > 0,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
@@ -239,6 +239,7 @@ def create_thd_dataloader(
         prefetch_factor: The prefetch factor to use for the dataloader.
         max_seq_length: The maximum length of sequences (window size).
         stride: The stride for windowing (overlap = stride tokens).
+        seed: The seed to use for the distributed sampler and data collator.
         buffer_size: The buffer size for shuffle.
         use_stateful_dataloader: Whether to use the StatefulDataLoader to enable checkpointing the dataloader state.
         text_column: Name of the column containing genomic sequences (default: "text").
@@ -299,7 +300,7 @@ def create_thd_dataloader(
         batch_size=None,  # The TokenPackingDataset will handle the batching.
         collate_fn=data_collator,
         num_workers=num_workers,
-        pin_memory=not use_stateful_dataloader,
+        pin_memory=True if not use_stateful_dataloader else False,
         persistent_workers=num_workers > 0,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )

@@ -1,8 +1,7 @@
 # syntax=docker/dockerfile:1.4
-FROM nvcr.io/nvidia/pytorch:26.02-py3
+FROM nvcr.io/nvidia/pytorch:26.01-py3
 
-# uv is pre-installed in the nvcr.io/nvidia/pytorch base image.
-# If using a base image without uv, uncomment the following line:
+# 1. Install uv (Method: COPY from official image is cleanest)
 #COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 WORKDIR /workspace/bionemo
@@ -21,13 +20,10 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 # We create it one level up (/workspace/.venv) to keep it out of the source dir
 RUN uv venv --system-site-packages --seed $VIRTUAL_ENV
 
-# 4. Pin transformer_engine to the version pre-installed in the base image.
-# Without this constraint uv may try to upgrade or rebuild TE, which breaks the build.
+# 4. Create a robust constraints file
+# It is safer to freeze ALL system packages to prevent uv from trying to upgrade them
+# accidentally, though your pyproject.toml overrides handle the critical ones.
 RUN pip freeze | grep transformer_engine > pip-constraints.txt
-
-## Trying to workaround CAUSAL_CONV1D build issues
-ENV CAUSAL_CONV1D_FORCE_BUILD=1
-ENV PIP_NO_BINARY=causal-conv1d
 
 # 5. Install package and dependencies
 RUN --mount=type=secret,id=netrc,target=/root/.netrc \

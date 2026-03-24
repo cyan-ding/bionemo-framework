@@ -15,29 +15,23 @@
 
 """Common test class for BioNeMo models, following HuggingFace transformers patterns."""
 
-import fnmatch
-import gc
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Type
+from typing import Callable, Dict, List, Literal, Type
 
 import pytest
 import torch
 import transformer_engine.pytorch
 from torch import nn
-from transformer_engine.common import recipe as recipe_module
 from transformer_engine.pytorch import QuantizedTensor
 from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 from transformers import AutoConfig, PretrainedConfig, PreTrainedModel, PreTrainedTokenizer, set_seed
 
 
-try:
-    HAS_DATA_CENTER_GPU = torch.cuda.is_available() and any(
-        gpu_name in torch.cuda.get_device_name(0).upper() for gpu_name in ["H100", "H200", "B100", "B200", "B300"]
-    )
-except (RuntimeError, AssertionError):
-    HAS_DATA_CENTER_GPU = False
+HAS_DATA_CENTER_GPU = any(
+    gpu_name in torch.cuda.get_device_name(0).upper() for gpu_name in ["H100", "H200", "B100", "B200", "B300"]
+)
 
 
 @dataclass
@@ -83,10 +77,6 @@ class BaseModelTest(ABC):
     Subclasses must implement all abstract methods to provide model-specific
     configuration, data preparation, and conversion functions.
 
-    Set ``is_autoregressive = True`` in subclasses for causal LM models to
-    enable generation / KV-cache smoke tests.  Non-autoregressive models
-    (e.g. ESM2) leave the default ``False`` and those tests are skipped.
-
     Example:
         ```python
         class ESM2ModelTester(BioNeMoModelTester):
@@ -102,8 +92,6 @@ class BaseModelTest(ABC):
             # ... implement other abstract methods
         ```
     """
-
-    is_autoregressive: bool = False
 
     @abstractmethod
     def get_model_class(self) -> Type[PreTrainedModel]:
@@ -294,9 +282,7 @@ class BaseModelTest(ABC):
                 if should_be_fp8:
                     if f"{name}.weight" in set(model._tied_weights_keys):
                         continue  # Skip tied weights
-                    elif hasattr(model, "_do_not_quantize") and any(
-                        fnmatch.fnmatch(name, pattern) for pattern in model._do_not_quantize
-                    ):
+                    elif hasattr(model, "_do_not_quantize") and name in model._do_not_quantize:
                         continue  # Skip weights that should be kept in bf16
                     assert isinstance(module.weight, QuantizedTensor), f"Module {name} weight is not a Float8Tensor"
 
@@ -353,18 +339,13 @@ class BaseModelTest(ABC):
         model.to("cuda")
         return model
 
-    def get_reference_model_no_weights(
-        self, dtype: torch.dtype = torch.float32, revision: str | None = None, **kwargs
-    ) -> PreTrainedModel:
+    def get_reference_model_no_weights(self) -> PreTrainedModel:
         """Load the reference HuggingFace model with random weights."""
-        if revision is None:
-            revision = self.get_upstream_model_revision()
         return self.get_upstream_model_class()(
             AutoConfig.from_pretrained(
                 self.get_upstream_model_id(),
-                dtype=dtype,
-                revision=revision,
-                **kwargs,
+                dtype=torch.float32,
+                revision=self.get_upstream_model_revision(),
             )
         )
 
@@ -429,15 +410,6 @@ class BaseModelTest(ABC):
                 )
 
     @pytest.fixture(autouse=True, scope="function")
-    def clear_gpu_memory(self):
-        """Clear GPU memory before and after each test to prevent OOM from fragmentation."""
-        gc.collect()
-        torch.cuda.empty_cache()
-        yield
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    @pytest.fixture(autouse=True, scope="function")
     def set_seed(self):
         set_seed(42)
 
@@ -453,6 +425,7 @@ class BaseModelTest(ABC):
         config = self.create_test_config(attn_input_format=input_format)
 
         model = model_class(config)
+        model.to(torch.bfloat16)
         model.to("cuda")
 
         # Prepare input data
@@ -475,6 +448,7 @@ class BaseModelTest(ABC):
         config = self.create_test_config(attn_input_format=input_format)
 
         model = model_class(config)
+        model.to(torch.bfloat16)
         model.to("cuda")
 
         # Prepare input data
@@ -497,6 +471,7 @@ class BaseModelTest(ABC):
         config = self.create_test_config(attn_input_format=input_format)
 
         model = model_class(config)
+        model.to(torch.bfloat16)
         model.to("cuda")
 
         # Prepare input data with labels
@@ -520,6 +495,7 @@ class BaseModelTest(ABC):
         config = self.create_test_config(attn_input_format=input_format)
 
         model = model_class(config)
+        model.to(torch.bfloat16)
         model.to("cuda")
 
         # Prepare input data
@@ -635,32 +611,13 @@ class BaseModelTest(ABC):
         type(self)._tmp_dir = tmp_path_factory.mktemp(self.__class__.__name__)
 
     def get_converted_te_model_checkpoint(self) -> Path:
-        """Get the path to the converted TE model checkpoint.
-
-        This method manages GPU memory carefully to support large models:
-        1. Load and convert the HF model
-        2. Free the HF model before saving
-        3. Move TE model to CPU before saving (save_pretrained clones state dict internally)
-        """
+        """Get the path to the converted TE model checkpoint."""
         model_hf = self.get_reference_model()
         convert_fn = self.get_hf_to_te_converter()
         model_te = convert_fn(model_hf)
-
-        # Free source model to reduce peak GPU memory
-        del model_hf
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        # Move to CPU before saving - save_pretrained internally clones the state dict,
-        # which would double GPU memory usage and OOM for large models.
-        model_te.to("cpu")
-
-        checkpoint_path: Path = self._tmp_dir / "converted_te_model"
+        model_te.to("cuda")
+        checkpoint_path = self._tmp_dir / "converted_te_model"
         model_te.save_pretrained(checkpoint_path)
-
-        del model_te
-        gc.collect()
-
         return checkpoint_path
 
     def get_converted_te_model(self, **kwargs) -> PreTrainedModel:
@@ -676,37 +633,25 @@ class BaseModelTest(ABC):
     # ==================== Golden Value Tests ====================
 
     def test_golden_values(self):
-        """Test that TE model outputs match HF reference model.
+        """Test that TE model outputs match HF reference model."""
+        model_hf = self.get_reference_model(dtype=torch.bfloat16)
+        model_te = self.get_converted_te_model(dtype=torch.bfloat16)
 
-        Models are run sequentially and freed between runs to support large models
-        that cannot fit two copies on a single GPU simultaneously.
-        """
+        model_hf.eval()
+        model_te.eval()
+
+        # Prepare input data
         input_data = self.get_test_input_data("bshd")
 
-        # Run HF model first, then free it
-        model_hf = self.get_reference_model(dtype=torch.bfloat16)
-        model_hf.eval()
-        with torch.no_grad():
-            hf_outputs = model_hf(**input_data)
-        hf_loss = hf_outputs.loss.detach().clone()
-        hf_logits = hf_outputs.logits.detach().clone()
-        del model_hf, hf_outputs
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        # Load and run TE model
-        model_te = self.get_converted_te_model(dtype=torch.bfloat16)
-        model_te.eval()
+        # Run forward pass
         with torch.no_grad():
             te_outputs = model_te(**input_data)
-        del model_te
-        gc.collect()
-        torch.cuda.empty_cache()
+            hf_outputs = model_hf(**input_data)
 
         # Compare outputs
         self.compare_outputs(
             te_outputs,
-            type("HFOutputs", (), {"loss": hf_loss, "logits": hf_logits})(),
+            hf_outputs,
             input_data,
             compare_loss=True,
             compare_logits=True,
@@ -735,23 +680,18 @@ class BaseModelTest(ABC):
         labels_thd = input_data_thd["labels"].flatten(0)
         torch.testing.assert_close(labels_bshd[labels_thd != -100], labels_thd[labels_thd != -100])
 
-        # Run models sequentially to support large models that cannot fit two copies on GPU
         model_bshd = self.get_converted_te_model(attn_input_format="bshd", dtype=torch.bfloat16)
+        model_thd = self.get_converted_te_model(attn_input_format="thd", dtype=torch.bfloat16)
+
         model_bshd.eval()
+        model_thd.eval()
+
         with torch.inference_mode():
             outputs_bshd = model_bshd(**input_data_bshd)
-        bshd_loss = outputs_bshd.loss.detach().clone()
-        bshd_logits = outputs_bshd.logits[input_data_bshd["attention_mask"].to(bool)].detach().clone()
-        del model_bshd, outputs_bshd
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        model_thd = self.get_converted_te_model(attn_input_format="thd", dtype=torch.bfloat16)
-        model_thd.eval()
-        with torch.inference_mode():
             outputs_thd = model_thd(**input_data_thd)
 
         # Compare logits
+        bshd_logits = outputs_bshd.logits[input_data_bshd["attention_mask"].to(bool)]
         torch.testing.assert_close(
             bshd_logits,
             outputs_thd.logits,
@@ -761,7 +701,7 @@ class BaseModelTest(ABC):
 
         # Compare losses
         torch.testing.assert_close(
-            bshd_loss,
+            outputs_bshd.loss,
             outputs_thd.loss,
             atol=tolerances.golden_value_loss_atol,
             rtol=tolerances.golden_value_loss_rtol,
@@ -841,93 +781,8 @@ class BaseModelTest(ABC):
         )
 
     # ==================== FP8 Tests ====================
-
-    @staticmethod
-    def _get_recipe_precision_and_kwargs(recipe):
-        """Determine layer precision string and model kwargs from a TE recipe.
-
-        Args:
-            recipe: A TransformerEngine quantization recipe.
-
-        Returns:
-            Tuple of (precision_string, model_kwargs_dict).
-        """
-        if isinstance(recipe, recipe_module.NVFP4BlockScaling):
-            return "fp4", {"fp4_recipe": recipe}
-        return "fp8", {"fp8_recipe": recipe}
-
     def test_fp8_forward_and_backward_pass(self, fp8_recipe, input_format):
-        """Test forward and backward with per-layer quantization precision configured via model kwargs."""
-        if input_format == "thd" and not HAS_DATA_CENTER_GPU:
-            pytest.xfail("Padded sequences are not supported on non-datacenter hardware for THD.")
-
-        precision, recipe_kwargs = self._get_recipe_precision_and_kwargs(fp8_recipe)
-
-        model_class = self.get_model_class()
-        config = self.create_test_config(
-            dtype=torch.bfloat16, attn_input_format=input_format, self_attn_mask_type="padding_causal"
-        )
-        config.layer_precision = [precision] * config.num_hidden_layers
-
-        model = model_class(config, **recipe_kwargs)
-        model.to("cuda")
-        model.eval()
-
-        input_data = self.get_test_input_data(input_format, pad_to_multiple_of=32)
-
-        # Forward pass - model handles autocast internally via get_autocast_context
-        outputs_fp8 = model(**input_data)
-        loss_fp8 = outputs_fp8.loss
-
-        assert torch.isfinite(loss_fp8)
-
-        # Backward pass
-        loss_fp8.backward()
-
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                assert param.grad is not None, f"Parameter {name} has no gradient after FP8 backward pass"
-
-    def test_quantized_model_init_forward_and_backward(self, fp8_recipe, input_format, **config_kwargs):
-        """Test forward and backward with quantized model init via config."""
-        if input_format == "thd" and not HAS_DATA_CENTER_GPU:
-            pytest.xfail("Padded sequences are not supported on non-datacenter hardware for THD.")
-
-        precision, recipe_kwargs = self._get_recipe_precision_and_kwargs(fp8_recipe)
-
-        model_class = self.get_model_class()
-        config = self.create_test_config(
-            attn_input_format=input_format, self_attn_mask_type="padding_causal", **config_kwargs
-        )
-        config.layer_precision = [precision] * config.num_hidden_layers
-        config.use_quantized_model_init = True
-
-        model = model_class(config, **recipe_kwargs)
-        model.to("cuda")
-        model.eval()
-
-        # Verify weights are actually quantized
-        self.verify_model_parameters_initialized_correctly(model, should_be_fp8=True)
-
-        input_data = self.get_test_input_data(input_format, pad_to_multiple_of=32)
-        if "labels" not in input_data:
-            input_data["labels"] = input_data["input_ids"].clone()
-
-        # Forward and backward pass - model handles autocast internally
-        outputs = model(**input_data)
-        loss = outputs.loss
-        assert torch.isfinite(loss)
-
-        loss.backward()
-
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                assert param.grad is not None, f"Parameter {name} has no gradient after FP8 backward pass"
-
-    # ==================== Legacy FP8 Tests (external context manager) ====================
-
-    def test_legacy_fp8_forward_and_backward_pass(self, fp8_recipe, input_format):
-        """Test that model works with external FP8 autocast context manager."""
+        """Test that model works with FP8 autocast."""
         if input_format == "thd" and not HAS_DATA_CENTER_GPU:
             pytest.xfail("Padded sequences are not supported on non-datacenter hardware for THD.")
 
@@ -973,15 +828,13 @@ class BaseModelTest(ABC):
             msg=lambda x: f"FP8 loss differs too much from BF16 loss: {x}",
         )
 
-    def test_legacy_quantized_model_init_forward_and_backward(self, fp8_recipe, input_format, **config_kwargs):
-        """Test that model initialized with external FP8 quantized_model_init context works correctly."""
+    def test_quantized_model_init_forward_and_backward(self, fp8_recipe, input_format):
+        """Test that model initialized with FP8 works correctly."""
         if input_format == "thd" and not HAS_DATA_CENTER_GPU:
             pytest.xfail("Padded sequences are not supported on non-datacenter hardware for THD.")
 
         model_class = self.get_model_class()
-        config = self.create_test_config(
-            attn_input_format=input_format, self_attn_mask_type="padding_causal", **config_kwargs
-        )
+        config = self.create_test_config(attn_input_format=input_format, self_attn_mask_type="padding_causal")
 
         # Initialize with FP8
         with transformer_engine.pytorch.quantized_model_init(recipe=fp8_recipe):
@@ -990,17 +843,15 @@ class BaseModelTest(ABC):
         model.to("cuda")
         model.eval()
 
-        # Verify weights are actually quantized
-        self.verify_model_parameters_initialized_correctly(model, should_be_fp8=True)
-
         # Prepare input data
         input_data = self.get_test_input_data(input_format, pad_to_multiple_of=32)
         if "labels" not in input_data:
             input_data["labels"] = input_data["input_ids"].clone()
 
         # Forward and backward pass with FP8
-        with transformer_engine.pytorch.autocast(recipe=fp8_recipe):
-            outputs = model(**input_data)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with transformer_engine.pytorch.autocast(recipe=fp8_recipe):
+                outputs = model(**input_data)
 
         loss = outputs.loss
         assert torch.isfinite(loss)
@@ -1070,122 +921,5 @@ class BaseModelTest(ABC):
         # Move to CUDA
         model.init_empty_weights()
         self.verify_model_parameters_initialized_correctly(model, should_be_fp8=True)
-
-    # ==================== Generation Tests (Autoregressive Models Only) ====================
-    @abstractmethod
-    def create_inference_params(self, config, batch_size=1, max_seq_len=256, num_beams=1) -> Any:
-        """Create inference params for KV-cache generation tests.
-
-        Autoregressive model tests must override this method to provide
-        model-specific ``HFInferenceParams`` with allocated KV-cache memory.
-
-        Args:
-            config: Model configuration.
-            batch_size: Batch size.
-            max_seq_len: Maximum sequence length.
-            num_beams: Number of beams for beam search.
-
-        Returns:
-            HFInferenceParams instance with allocated memory.
-        """
-        pass
-
-    def test_generate_without_cache(self):
-        """Test basic generation without KV-cache (BSHD, use_cache=False)."""
-        if not self.is_autoregressive:
-            pytest.skip("Not an autoregressive model")
-
-        config = self.create_test_config(attn_input_format="bshd", self_attn_mask_type="causal")
-        model = self.get_model_class()(config).to("cuda")
-        model.eval()
-
-        tokenizer = self.get_tokenizer()
-        prompt = "The quick brown fox jumps over"
-        inputs = tokenizer(prompt, return_tensors="pt")
-        inputs = {k: v.to("cuda") for k, v in inputs.items()}
-
-        with torch.no_grad():
-            output_ids = model.generate(**inputs, max_new_tokens=16, use_cache=False)
-
-        assert output_ids.shape[1] > inputs["input_ids"].shape[1]
-
-    def test_generate_with_cache(self):
-        """Test single-prompt generation with KV-cache (THD format)."""
-        if not self.is_autoregressive:
-            pytest.skip("Not an autoregressive model")
-
-        config = self.create_test_config(attn_input_format="thd", self_attn_mask_type="padding_causal")
-        model = self.get_model_class()(config).to("cuda")
-        model.eval()
-
-        tokenizer = self.get_tokenizer()
-        prompt = "The quick brown fox jumps over"
-        inputs = tokenizer(prompt, return_tensors="pt")
-        inputs = {k: v.to("cuda") for k, v in inputs.items()}
-
-        past_key_values = self.create_inference_params(config, batch_size=1)
-
-        with torch.no_grad():
-            output_ids = model.generate(**inputs, max_new_tokens=16, use_cache=True, past_key_values=past_key_values)
-
-        assert output_ids.shape[1] > inputs["input_ids"].shape[1]
-
-    def test_generate_with_cache_batched(self):
-        """Test batched generation with KV-cache (left-padded BSHD converted to THD)."""
-        if not self.is_autoregressive:
-            pytest.skip("Not an autoregressive model")
-
-        config = self.create_test_config(attn_input_format="thd", self_attn_mask_type="padding_causal")
-        model = self.get_model_class()(config).to("cuda")
-        model.eval()
-
-        tokenizer = self.get_tokenizer()
-        prompts = (
-            "The quick brown fox jumps over the lazy dog.",
-            "Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
-        )
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True, padding_side="left")
-        inputs = {k: v.to("cuda") for k, v in inputs.items()}
-
-        past_key_values = self.create_inference_params(config, batch_size=2)
-
-        with torch.no_grad():
-            output_ids = model.generate(**inputs, max_new_tokens=16, use_cache=True, past_key_values=past_key_values)
-
-        assert output_ids.shape[0] == 2
-        assert output_ids.shape[1] > inputs["input_ids"].shape[1]
-
-    def test_generate_with_cache_beam_search(self):
-        """Test batched generation with KV-cache and beam search."""
-        if not self.is_autoregressive:
-            pytest.skip("Not an autoregressive model")
-
-        config = self.create_test_config(attn_input_format="thd", self_attn_mask_type="padding_causal")
-        model = self.get_model_class()(config).to("cuda")
-        model.eval()
-
-        tokenizer = self.get_tokenizer()
-        prompts = (
-            "The quick brown fox jumps over the lazy dog.",
-            "Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
-        )
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True, padding_side="left")
-        inputs = {k: v.to("cuda") for k, v in inputs.items()}
-
-        num_beams = 2
-        past_key_values = self.create_inference_params(config, batch_size=2, num_beams=num_beams)
-
-        with torch.no_grad():
-            output_ids = model.generate(
-                **inputs,
-                max_new_tokens=16,
-                use_cache=True,
-                past_key_values=past_key_values,
-                num_beams=num_beams,
-                do_sample=True,
-            )
-
-        assert output_ids.shape[0] == 2
-        assert output_ids.shape[1] > inputs["input_ids"].shape[1]
 
     # TODO: add multi-GPU tests, e.g., meta-device init after fully_shard, cp tests, etc.

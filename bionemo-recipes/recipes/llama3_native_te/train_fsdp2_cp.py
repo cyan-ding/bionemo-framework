@@ -13,23 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FSDP2 with Context Parallelism training script for Llama 3 with TransformerEngine.
-
-Combines Fully Sharded Data Parallel v2 with Context Parallelism (CP), where each sequence is
-split across multiple GPUs along the sequence dimension. This is useful for training with very long
-sequences that do not fit into a single GPU's memory even with FSDP2 alone. Only supports
-TE-accelerated models (NVLlamaForCausalLM).
-
-For standard FSDP2 training without context parallelism, use ``train_fsdp2.py`` instead.
-"""
-
 import gc
 import logging
 from contextlib import nullcontext
 from pathlib import Path
 
 import hydra
-import nvtx
 import torch
 import transformer_engine.pytorch
 from omegaconf import DictConfig, OmegaConf
@@ -38,13 +27,7 @@ from torch.distributed.fsdp import fully_shard
 from torch.optim import AdamW
 from transformer_engine.common.recipe import Format
 
-from checkpoint import (
-    _ckpt_futures,
-    load_checkpoint_fsdp2,
-    save_checkpoint_fsdp2,
-    save_final_model_fsdp2,
-    should_save_checkpoint,
-)
+from checkpoint import load_checkpoint_fsdp2, save_checkpoint_fsdp2, save_final_model_fsdp2, should_save_checkpoint
 from collator import ContextParallelDataLoaderWrapper, DataCollatorForContextParallel
 from dataset import create_bshd_dataloader, create_thd_dataloader
 from distributed_config import DistributedConfig
@@ -59,46 +42,48 @@ logger.setLevel(logging.INFO)
 
 @hydra.main(config_path="hydra_config", config_name="L0_sanity_cp", version_base="1.2")
 def main(args: DictConfig) -> float | None:
-    """Train Llama3 with TE layers using FSDP2 with Context Parallelism.
+    """Train Llama3 with TE layers using FSDP2.
 
     Returns:
         float: The loss value for the final batch.
     """
-    # --- Distributed Setup ---
+    # Initialize the distributed configuration, including creating the distributed process group.
     dist_config = DistributedConfig()
     logger.info("Initializing distributed training: %s", dist_config)
     device = torch.device(f"cuda:{dist_config.local_rank}")
     torch.distributed.init_process_group(backend="cpu:gloo,cuda:nccl", device_id=device)
     torch.cuda.set_device(dist_config.local_rank)
 
+    # Create a device mesh for FSDP.
     device_mesh = init_device_mesh(
         "cuda",
         mesh_shape=(dist_config.world_size // args.cp_size, args.cp_size),
         mesh_dim_names=("dp", "cp"),
     )
-    logger.info("Created device mesh: %s", device_mesh)
+    logger.info(f"Created device mesh: {device_mesh}")
 
-    # --- Model Configuration ---
-    # Create quantization recipes -- only used if FP8/FP4 is enabled in the config.
-    fp8_recipe = None
-    if args.fp8_config.enabled:
-        fp8_recipe = hydra.utils.get_class(args.fp8_config.fp8_recipe)(
-            fp8_format=Format[args.fp8_config.fp8_format], **args.fp8_config.fp8_recipe_kwargs
-        )
+    # Create an FP8 recipe -- this is only used if FP8 is enabled in the config.
+    fp8_recipe = hydra.utils.get_class(args.fp8_config.fp8_recipe)(
+        fp8_format=Format[args.fp8_config.fp8_format], **args.fp8_config.fp8_recipe_kwargs
+    )
 
-    fp4_recipe = None
-    if args.fp4_config.enabled:
-        fp4_recipe = hydra.utils.get_class(args.fp4_config.fp4_recipe)(**args.fp4_config.fp4_recipe_kwargs)
-
-    # --- Model Initialization ---
+    # Create an empty Llama3 model with a causal language model head, e.g. "meta-llama/Meta-Llama-3-8B".
     config = NVLlamaConfig.from_pretrained(args.config_name_or_path, dtype=torch.bfloat16, **args.config_kwargs)
 
-    with torch.device("meta") if args.use_meta_device else nullcontext():
-        model = NVLlamaForCausalLM(config, fp8_recipe=fp8_recipe, fp4_recipe=fp4_recipe)
+    # Optionally use transformer engine to initialize only fp8 versions of weights by setting
+    # `fp8_config.quantized_model_init_kwargs.enabled` to `True`, as opposed to using the default where both bfloat16 and fp8
+    # versions of weights are kept.
+    with (
+        torch.device("meta") if args.use_meta_device else nullcontext(),
+        transformer_engine.pytorch.quantized_model_init(
+            recipe=fp8_recipe, **args.fp8_config.quantized_model_init_kwargs
+        ),
+    ):
+        model = NVLlamaForCausalLM(config)
 
     logger.info("Initialized Model:\n%s", model)
 
-    # --- Distributed Wrapping (FSDP2 + CP) ---
+    # Create a flattened mesh for FSDP2 sharding. This will shard the model across both the DP and CP ranks.
     cp_dp_mesh = device_mesh["dp", "cp"]._flatten(mesh_dim_name="dp_shard_cp")
 
     # Shard the transformer layers with FSDP. For Llama3, the transformer stack is in model.model.layers.
@@ -119,8 +104,7 @@ def main(args: DictConfig) -> float | None:
         # TE layers require special handling to initialize the weights from the meta device.
         model.init_empty_weights()
 
-    # --- Optimizer & Scheduler ---
-    # Convert OmegaConf to regular dict to avoid serialization issues (BIONEMO-2873).
+    # Create optimizer. Convert OmegaConf to regular dict to avoid serialization issues (BIONEMO-2873).
     optimizer = AdamW(model.parameters(), **OmegaConf.to_container(args.adamw_kwargs, resolve=True))  # type: ignore
     scheduler = get_cosine_annealing_schedule_with_warmup(optimizer, **args.lr_scheduler_kwargs)
 
@@ -128,16 +112,9 @@ def main(args: DictConfig) -> float | None:
         # If we're using torch.compile, we need to do this before loading the checkpoint to ensure key consistency.
         model = torch.compile(model)
 
-    # --- Data Loading ---
-    # Create the context-aware dataloader.
-    if args.dataset.get("pad_sequences_to_be_divisible_by", None) is None:
-        # The dual chunk algorithm gives each CP rank 2 chunks from each sequence, so we need each sequence to be
-        # divisible by cp_mesh.size() * 2.
-        logger.info("pad_sequences_to_be_divisible_by is not provided, using cp_mesh.size() * 2")
-        OmegaConf.update(args, "dataset.pad_sequences_to_be_divisible_by", device_mesh["cp"].size() * 2)
-
-    # We only create the dataloader on rank 0, which is responsible for loading data for all CP (and eventually TP)
-    # ranks. This ensures that the data remains synchronized, even if we're using a non-deterministic data pipeline.
+    # Create the context-aware dataloader. We only create the dataloader on rank 0 and wrap it in a
+    # ContextParallelDataLoaderWrapper that will shard and distribute the data across the context parallelism group.
+    args.dataset.setdefault("pad_sequences_to_be_divisible_by", device_mesh["cp"].size() * 2)
     if device_mesh["cp"].get_local_rank() == 0:
         if args.use_sequence_packing:
             train_dataloader, dataset_or_sampler = create_thd_dataloader(dist_config, **args.dataset)
@@ -146,7 +123,7 @@ def main(args: DictConfig) -> float | None:
 
         train_dataloader.collate_fn = DataCollatorForContextParallel(
             collator=train_dataloader.collate_fn,
-            device_mesh=device_mesh,
+            cp_world_size=device_mesh["cp"].size(),
             qkv_format=args.config_kwargs.attn_input_format,
             is_causal_lm=True,
         )
@@ -155,13 +132,12 @@ def main(args: DictConfig) -> float | None:
         train_dataloader = None
         dataset_or_sampler = None
 
-    # On all ranks, we create a ContextParallelDataLoaderWrapper that broadcasts the data from cp rank 0.
     train_dataloader = ContextParallelDataLoaderWrapper(train_dataloader, device_mesh["cp"])
 
-    # --- Checkpoint Resume ---
+    # If we're resuming from a checkpoint, load it and set the start step. Otherwise, start from step 0.
     ckpt_path = Path(args.checkpoint.ckpt_dir) / "train_fsdp2" if args.checkpoint.ckpt_dir else None
     if args.checkpoint.resume_from_checkpoint and ckpt_path:
-        logger.info("Attempting to load checkpoint from %s", ckpt_path)
+        logger.info(f"Attempting to load checkpoint from {ckpt_path}")
         model, optimizer, scheduler, train_dataloader, start_step, epoch = load_checkpoint_fsdp2(
             model=model,
             optimizer=optimizer,
@@ -171,19 +147,19 @@ def main(args: DictConfig) -> float | None:
             dataloader=train_dataloader,
             process_group=cp_dp_mesh.get_group(),
         )
-        logger.info("Checkpoint loaded, resuming from step %s, epoch %s", start_step, epoch)
+        logger.info(f"Checkpoint loaded, resuming from step {start_step}, epoch {epoch}")
     else:
         logger.info("No checkpoint to load, starting from scratch")
         start_step = 0
         epoch = 0
 
-    perf_logger = PerfLogger(dist_config, args, start_step=start_step)
+    perf_logger = PerfLogger(dist_config, args)
 
     gc.collect()
     torch.cuda.empty_cache()
 
-    # --- Training Loop ---
-    logger.info("Starting training loop from step %s to %s", start_step, args.num_train_steps)
+    # Training loop
+    logger.info(f"Starting training loop from step {start_step} to {args.num_train_steps}")
     step = start_step
     micro_step = 0  # Gradient accumulation step counter
     while step < args.num_train_steps:
@@ -193,25 +169,22 @@ def main(args: DictConfig) -> float | None:
             micro_step += 1
 
             # Forward pass with mixed precision.
-            with nvtx.annotate("Forward pass", color="green"):
-                with transformer_engine.pytorch.autocast(enabled=args.fp8_config.enabled, recipe=fp8_recipe):
-                    outputs = model(**batch)
+            with transformer_engine.pytorch.autocast(enabled=args.fp8_config.enabled, recipe=fp8_recipe):
+                outputs = model(**batch)
 
             # Backward pass - scale loss by grad_acc_steps for proper gradient averaging
             loss = outputs.loss / args.grad_acc_steps
-
-            with nvtx.annotate("Backward pass", color="red"):
-                loss.backward()
+            loss.backward()
 
             # Log microbatch step data for accumulation metrics
-            perf_logger.log_micro_step(step=step, batch=batch, outputs=outputs)
+            perf_logger.log_micro_step(batch=batch, outputs=outputs)
 
-            # The end of a "full" step (i.e. after possibly multiple gradient accumulation steps).
+            # Gradient accumulation - only step optimizer after accumulating gradients
             if micro_step % args.grad_acc_steps == 0:
                 micro_step = 0
 
                 # Compute and clip gradient norms.
-                total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
 
                 # Step optimizer.
                 optimizer.step()
@@ -239,16 +212,16 @@ def main(args: DictConfig) -> float | None:
                         async_save=args.checkpoint.async_save,
                     )
 
-                step += 1
-                if step >= args.num_train_steps:
-                    break
+            step += 1
+            if step >= args.num_train_steps:
+                break
 
         # Dataloader exhausted, incrementing epoch
         epoch += 1
         if dataset_or_sampler is not None:  # The dataset only exists on rank 0
             dataset_or_sampler.set_epoch(epoch)
 
-    # --- Cleanup ---
+    # Save final model to a .safetensors file.
     if args.checkpoint.save_final_model and ckpt_path:
         save_final_model_fsdp2(
             model=model,
@@ -256,10 +229,7 @@ def main(args: DictConfig) -> float | None:
             dist_config=dist_config,
         )
 
-    # Make sure we don't have any outstanding checkpoint save futures.
-    if args.checkpoint.async_save and "fsdp2" in _ckpt_futures and _ckpt_futures["fsdp2"] is not None:
-        _ckpt_futures["fsdp2"].result()
-
+    # Clean up distributed training
     perf_logger.finish()
     torch.distributed.destroy_process_group()
 

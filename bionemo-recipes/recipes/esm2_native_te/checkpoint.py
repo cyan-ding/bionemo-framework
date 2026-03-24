@@ -82,7 +82,9 @@ def get_latest_checkpoint(ckpt_path: str | os.PathLike) -> tuple[Path | None, in
 
 def should_save_checkpoint(step: int, save_every_n_steps: int) -> bool:
     """Determine if a checkpoint should be saved."""
-    return save_every_n_steps > 0 and step % save_every_n_steps == 0 and step > 0
+    if save_every_n_steps > 0 and step % save_every_n_steps == 0 and step > 0:
+        return True
+    return False
 
 
 def prune_checkpoints(ckpt_path: str | os.PathLike, max_checkpoints: int) -> None:
@@ -358,7 +360,6 @@ class AppState(Stateful):
         default_factory=lambda: StateDictOptions(
             full_state_dict=False,
             cpu_offload=True,
-            strict=False,
         )
     )
 
@@ -588,7 +589,7 @@ def load_dataloader(
         )
         return dataloader
 
-    dataloader_state = torch.load(dataloader_path, weights_only=True)
+    dataloader_state = torch.load(dataloader_path)
 
     if (
         dataloader.num_workers != dataloader_state["num_workers"]

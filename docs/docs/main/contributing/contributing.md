@@ -246,18 +246,17 @@ pip install -r dev-requirements.txt --user
 python ci/scripts/license_check.py --modify --replace --license-header ./license_header -c sub-packages/ -c docs/ -c scripts/ -c ci/ -c internal/
 ```
 
-#### Secret Detection
+#### Updating the secrets baseline file
 
-We use [gitleaks](https://github.com/gitleaks/gitleaks) to detect hardcoded secrets in the codebase. The configuration
-is in `.gitleaks.toml`.
+If false-positives are raised by the [detect-secrets](https://github.com/Yelp/detect-secrets) pre-commit hook, they can
+be added to the baseline files by running the following commands:
 
-If gitleaks raises a false positive, you can suppress it by adding a `gitleaks:allow` comment on the offending line:
-
-```python
-api_url = "https://example.com/v1"  # gitleaks:allow
+```bash
+detect-secrets scan --baseline .secrets.baseline --exclude-files '(.*\.ipynb|.*\.baseline)$'
+detect-secrets scan --baseline .secrets-nb.baseline --exclude-files '^.(?!.*\.ipynb)' --exclude-lines '"(hash|id|image/\w+)":.*'
 ```
 
-Alternatively, you can add a path or regex pattern to the `[allowlist]` section in `.gitleaks.toml`.
+The resulting altered baseline files should then be committed.
 
 ## Contributing Python Sub-Packages to BioNeMo Framework
 

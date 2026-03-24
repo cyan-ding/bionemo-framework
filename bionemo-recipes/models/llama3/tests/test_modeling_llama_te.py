@@ -20,6 +20,8 @@ This file provides comprehensive tests for the LLaMA3 model including:
 - LLaMA-specific tests (inference, generation, THD inputs, etc.)
 """
 
+import gc
+import os
 from typing import Callable, Dict, List, Literal, Type
 
 import pytest
@@ -27,6 +29,7 @@ import torch
 import transformers
 from torch import nn
 from transformers import (
+    AutoModelForCausalLM,
     AutoTokenizer,
     DataCollatorForLanguageModeling,
     PretrainedConfig,
@@ -45,8 +48,6 @@ class TestLlama3Model(BaseModelTest):
 
     This class provides LLaMA3-specific configuration for the common test suite.
     """
-
-    is_autoregressive = True
 
     def get_model_class(self) -> Type[PreTrainedModel]:
         """Return the LLaMA3 TE model class."""
@@ -137,23 +138,7 @@ class TestLlama3Model(BaseModelTest):
             cp_loss_rtol=0.25,
         )
 
-    # ==================== LLaMA3-Specific Overrides ====================
-
-    def create_inference_params(self, config, batch_size=1, max_seq_len=256, num_beams=1):
-        """Create HFInferenceParams for the given config."""
-        past_key_values = HFInferenceParams(
-            max_batch_size=batch_size * num_beams,
-            max_sequence_length=max_seq_len,
-            num_heads_kv=config.num_key_value_heads,
-            head_dim_k=config.hidden_size // config.num_attention_heads,
-            dtype=torch.bfloat16,
-            qkv_format="thd",
-            max_ctx_len=max_seq_len,
-        )
-        for layer_number in range(1, config.num_hidden_layers + 1):
-            past_key_values.allocate_memory(layer_number)
-        return past_key_values
-
+    # ==================== LLaMA3-Specific Tests ====================
     def test_golden_values(self, input_format):  # pyright: ignore[reportIncompatibleMethodOverride]
         """For llama3, we can test both the dynamic sequence packing and native bshd attention formats."""
         model_hf = self.get_reference_model(dtype=torch.bfloat16)
@@ -177,9 +162,210 @@ class TestLlama3Model(BaseModelTest):
             compare_hidden_states=False,
         )
 
-    @pytest.mark.parametrize("tie_word_embeddings", [True, False])
-    def test_quantized_model_init_forward_and_backward(self, fp8_recipe, input_format, tie_word_embeddings):  # pyright: ignore[reportIncompatibleMethodOverride]
-        """There was a weird bug in BIO-217 on tied weights with quantized model init, so we test both cases."""
-        super().test_quantized_model_init_forward_and_backward(
-            fp8_recipe, input_format, tie_word_embeddings=tie_word_embeddings
+
+# NOTE: Keeping remaining LLaMA-specific tests (inference, generation, etc.) unchanged
+# These tests are specific to causal LM functionality and don't have ESM2 equivalents
+
+
+@pytest.fixture
+def input_text():
+    return (
+        """Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.""",
+        "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore "
+        "et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip "
+        "ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu "
+        "fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt "
+        "mollit anim id est laborum.",
+    )
+
+
+@pytest.mark.skipif(os.getenv("CI", "false") == "true", reason="Skipping test in CI not download llama3 model.")
+def test_llama_model_golden_values_padding_left(input_text):
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
+    model_hf = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B-Instruct", dtype=torch.bfloat16)
+
+    model_te = convert_llama_hf_to_te(model_hf, attn_input_format="thd")
+
+    tokenizer.pad_token = tokenizer.eos_token
+    inputs = tokenizer(input_text, return_tensors="pt", padding=True, padding_side="left")
+    inputs = {k: v.to("cuda") for k, v in inputs.items()}
+    labels = inputs["input_ids"].clone()
+    labels[labels == tokenizer.pad_token_id] = -100
+    model_hf.to("cuda")
+    with torch.no_grad():
+        outputs_hf = model_hf(**inputs, labels=labels, output_hidden_states=True)
+
+    del model_hf
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    model_te.to("cuda")
+    with torch.no_grad():
+        outputs_te = model_te(**inputs, labels=labels, output_hidden_states=True)
+
+    torch.testing.assert_close(outputs_te.loss, outputs_hf.loss, atol=0.02, rtol=0.03)  # Higher than I'd like.
+    torch.testing.assert_close(
+        outputs_te.logits[inputs["attention_mask"].to(bool)],
+        outputs_hf.logits[inputs["attention_mask"].to(bool)],
+        atol=1.5,
+        rtol=0.01,
+    )
+
+
+@pytest.mark.skipif(os.getenv("CI", "false") == "true", reason="Skipping test in CI not download llama3 model.")
+def test_hf_llama_model_generate_bshd():
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
+    model_hf = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B-Instruct", dtype=torch.bfloat16)
+
+    prompt = (
+        """
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at""",
+        "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore",
+    )
+
+    tokenizer.pad_token = tokenizer.eos_token
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True, padding_side="left")
+    inputs = {k: v.to("cuda") for k, v in inputs.items()}
+    model_hf.to("cuda")
+
+    with torch.no_grad():
+        output_ids = model_hf.generate(**inputs, max_new_tokens=16, use_cache=False)
+
+    generated_text = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+    assert "http://www.apache.org/licenses/LICENSE-2.0" in generated_text[0]
+    assert "et dolore magna aliqua. Ut enim ad minim " in generated_text[1]
+
+
+@pytest.mark.skipif(os.getenv("CI", "false") == "true", reason="Skipping test in CI not download llama3 model.")
+def test_te_llama_model_generate_with_cache():
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
+    model_hf = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B-Instruct", dtype=torch.bfloat16)
+    model_te = convert_llama_hf_to_te(model_hf, attn_input_format="thd", self_attn_mask_type="padding_causal")
+
+    prompt = """
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at"""
+
+    inputs = tokenizer(prompt, return_tensors="pt")
+    inputs = {k: v.to("cuda") for k, v in inputs.items()}
+    model_te.to("cuda")
+
+    past_key_values = HFInferenceParams(
+        max_batch_size=1,
+        max_sequence_length=256,
+        num_heads_kv=model_te.config.num_key_value_heads,
+        head_dim_k=model_te.config.hidden_size // model_te.config.num_attention_heads,
+        dtype=torch.bfloat16,
+        qkv_format="thd",
+        max_ctx_len=256,
+    )
+
+    for layer_number in range(1, model_te.config.num_hidden_layers + 1):
+        past_key_values.allocate_memory(layer_number)
+
+    with torch.no_grad():
+        output_ids = model_te.generate(**inputs, max_new_tokens=16, use_cache=True, past_key_values=past_key_values)
+
+    generated_text = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+    assert "http://www.apache.org/licenses/LICENSE-2.0" in generated_text[0]
+
+
+@pytest.mark.skipif(os.getenv("CI", "false") == "true", reason="Skipping test in CI not download llama3 model.")
+def test_te_llama_model_generate_with_cache_bshd():
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
+    model_hf = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B-Instruct", dtype=torch.bfloat16)
+    model_te = convert_llama_hf_to_te(model_hf, attn_input_format="thd")
+
+    prompt = (
+        """
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at""",
+        "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore",
+    )
+
+    tokenizer.pad_token = tokenizer.eos_token
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True, padding_side="left")
+    inputs = {k: v.to("cuda") for k, v in inputs.items()}
+    model_te.to("cuda")
+
+    past_key_values = HFInferenceParams(
+        max_batch_size=2,
+        max_sequence_length=256,
+        num_heads_kv=model_te.config.num_key_value_heads,
+        head_dim_k=model_te.config.hidden_size // model_te.config.num_attention_heads,
+        dtype=torch.bfloat16,
+        qkv_format="thd",
+        max_ctx_len=256,
+    )
+
+    for layer_number in range(1, model_te.config.num_hidden_layers + 1):
+        past_key_values.allocate_memory(layer_number)
+
+    with torch.no_grad():
+        output_ids = model_te.generate(
+            **inputs,
+            max_new_tokens=16,
+            use_cache=True,
+            past_key_values=past_key_values,
         )
+
+    generated_text = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+    assert "http://www.apache.org/licenses/LICENSE-2.0" in generated_text[0]
+    assert "et dolore magna aliqua. Ut enim ad minim " in generated_text[1]
+
+
+@pytest.mark.skipif(os.getenv("CI", "false") == "true", reason="Skipping test in CI not download llama3 model.")
+def test_te_llama_model_generate_with_cache_bshd_beam_search():
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
+    model_hf = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B-Instruct", dtype=torch.bfloat16)
+    model_te = convert_llama_hf_to_te(model_hf, attn_input_format="thd")
+
+    prompt = (
+        """
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at""",
+        "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore",
+    )
+
+    tokenizer.pad_token = tokenizer.eos_token
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True, padding_side="left")
+    inputs = {k: v.to("cuda") for k, v in inputs.items()}
+    model_te.to("cuda")
+
+    num_beams = 2
+
+    past_key_values = HFInferenceParams(
+        max_batch_size=2 * num_beams,
+        max_sequence_length=256,
+        num_heads_kv=model_te.config.num_key_value_heads,
+        head_dim_k=model_te.config.hidden_size // model_te.config.num_attention_heads,
+        dtype=torch.bfloat16,
+        qkv_format="thd",
+        max_ctx_len=256,
+    )
+
+    for layer_number in range(1, model_te.config.num_hidden_layers + 1):
+        past_key_values.allocate_memory(layer_number)
+
+    with torch.no_grad():
+        output_ids = model_te.generate(
+            **inputs,
+            max_new_tokens=16,
+            use_cache=True,
+            past_key_values=past_key_values,
+            num_beams=num_beams,
+            do_sample=True,
+        )
+
+    generated_text = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+    assert "http://www.apache.org/licenses/LICENSE-2.0" in generated_text[0]
+    assert "et dolore magna aliqua. Ut enim ad minim " in generated_text[1]

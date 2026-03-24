@@ -13,13 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import warnings
-
 import peft
 import pytest
 import torch
 
-from modeling_esm_te import NVEsmForMaskedLM
+from esm.modeling_esm_te import NVEsmForMaskedLM
 
 
 def test_create_peft_model(te_model_checkpoint):
@@ -73,9 +71,7 @@ def test_lora_model_raises_no_warnings(te_model_checkpoint):
         bias="none",
     )
 
-    with warnings.catch_warnings(record=True) as record:
-        # Cause all warnings to be triggered (default behavior may ignore some)
-        warnings.simplefilter("always")
+    with pytest.warns(UserWarning) as record:
         peft.get_peft_model(model, peft_config)
 
     assert len(record) == 0

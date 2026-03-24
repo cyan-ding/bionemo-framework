@@ -154,8 +154,8 @@ def test_sanity_ddp_fp8_stats_logging(tmp_path, recipe_path):
                 f"+wandb_init_args.dir={tmp_path}",
                 f"checkpoint.ckpt_dir={tmp_path}",
                 "fp8_config.enabled=true",
-                "quant_stats_config.enabled=true",
-                f"quant_stats_config.quant_log_dir={fp8_log_dir}",
+                "fp8_stats_config.enabled=true",
+                f"fp8_stats_config.fp8_log_dir={fp8_log_dir}",
                 "num_train_steps=4",
             ],
         )
@@ -180,79 +180,6 @@ def test_sanity_ddp_fp8_stats_logging(tmp_path, recipe_path):
     # Verify files are non-empty
     assert metadata_log.stat().st_size > 0, "Metadata log file is empty"
     assert stats_log.stat().st_size > 0, "Statistics log file is empty"
-
-
-@requires_fp8
-def test_sanity_ddp_fp8_partial_layers_stats_logging(tmp_path, recipe_path):
-    """Test that layer-wise FP8 stats logging only collects stats for the specified FP8 layers."""
-    fp8_log_dir = tmp_path / "fp8_stats_logs"
-
-    with initialize_config_dir(config_dir=str(recipe_path / "hydra_config"), version_base="1.2"):
-        sanity_config = compose(
-            config_name="L0_sanity",
-            overrides=[
-                f"+wandb_init_args.dir={tmp_path}",
-                f"checkpoint.ckpt_dir={tmp_path}",
-                "fp8_config.enabled=true",
-                "fp8_layers=[1,2,3]",
-                "quant_stats_config.enabled=true",
-                f"quant_stats_config.quant_log_dir={fp8_log_dir}",
-                "num_train_steps=4",
-            ],
-        )
-
-    main_ddp(sanity_config)
-
-    metadata_log = fp8_log_dir / "rank_0" / "nvdlfw_inspect_logs" / "nvdlfw_inspect_globalrank-0.log"
-    stats_log = fp8_log_dir / "rank_0" / "nvdlfw_inspect_statistics_logs" / "nvdlfw_inspect_globalrank-0.log"
-
-    assert metadata_log.exists(), "Metadata log file was not created"
-    assert stats_log.exists(), "Statistics log file was not created"
-    assert metadata_log.stat().st_size > 0, "Metadata log file is empty"
-    assert stats_log.stat().st_size > 0, "Statistics log file is empty"
-
-    # Verify that stats are only collected for layers 1-3 (the FP8 layers), not 4-6 (BF16 layers).
-    stats_content = stats_log.read_text()
-    for layer in [1, 2, 3]:
-        assert f"layers.{layer}." in stats_content, f"Expected stats for FP8 layer {layer}"
-    for layer in [4, 5, 6]:
-        assert f"layers.{layer}." not in stats_content, f"Unexpected stats for BF16 layer {layer}"
-
-
-@requires_fp8
-def test_sanity_fsdp2_fp8_partial_layers_stats_logging(tmp_path, recipe_path):
-    """Test that layer-wise FP8 stats logging works with FSDP2 for a subset of layers."""
-    fp8_log_dir = tmp_path / "fp8_stats_logs"
-
-    with initialize_config_dir(config_dir=str(recipe_path / "hydra_config"), version_base="1.2"):
-        sanity_config = compose(
-            config_name="L0_sanity",
-            overrides=[
-                f"+wandb_init_args.dir={tmp_path}",
-                f"checkpoint.ckpt_dir={tmp_path}",
-                "fp8_config.enabled=true",
-                "fp8_layers=[1,2,3]",
-                "quant_stats_config.enabled=true",
-                f"quant_stats_config.quant_log_dir={fp8_log_dir}",
-                "num_train_steps=4",
-            ],
-        )
-
-    main_fsdp2(sanity_config)
-
-    metadata_log = fp8_log_dir / "rank_0" / "nvdlfw_inspect_logs" / "nvdlfw_inspect_globalrank-0.log"
-    stats_log = fp8_log_dir / "rank_0" / "nvdlfw_inspect_statistics_logs" / "nvdlfw_inspect_globalrank-0.log"
-
-    assert metadata_log.exists(), "Metadata log file was not created"
-    assert stats_log.exists(), "Statistics log file was not created"
-    assert metadata_log.stat().st_size > 0, "Metadata log file is empty"
-    assert stats_log.stat().st_size > 0, "Statistics log file is empty"
-
-    stats_content = stats_log.read_text()
-    for layer in [1, 2, 3]:
-        assert f"layers.{layer}." in stats_content, f"Expected stats for FP8 layer {layer}"
-    for layer in [4, 5, 6]:
-        assert f"layers.{layer}." not in stats_content, f"Unexpected stats for BF16 layer {layer}"
 
 
 @requires_fp8
@@ -284,8 +211,8 @@ def test_sanity_fsdp2_fp8_stats_logging(tmp_path, recipe_path):
                 f"+wandb_init_args.dir={tmp_path}",
                 f"checkpoint.ckpt_dir={tmp_path}",
                 "fp8_config.enabled=true",
-                "quant_stats_config.enabled=true",
-                f"quant_stats_config.quant_log_dir={fp8_log_dir}",
+                "fp8_stats_config.enabled=true",
+                f"fp8_stats_config.fp8_log_dir={fp8_log_dir}",
                 "num_train_steps=4",
             ],
         )
@@ -293,20 +220,9 @@ def test_sanity_fsdp2_fp8_stats_logging(tmp_path, recipe_path):
     main_fsdp2(sanity_config)
 
     # Verify log structure (same assertions as above)
-    assert fp8_log_dir.exists(), "FP8 log directory was not created"
-    assert (fp8_log_dir / "rank_0").exists(), "rank_0 directory was not created"
-    assert (fp8_log_dir / "rank_0" / "nvdlfw_inspect_logs").exists(), "nvdlfw_inspect_logs directory was not created"
-    assert (fp8_log_dir / "rank_0" / "nvdlfw_inspect_statistics_logs").exists(), (
-        "nvdlfw_inspect_statistics_logs directory was not created"
-    )
-
-    metadata_log = fp8_log_dir / "rank_0" / "nvdlfw_inspect_logs" / "nvdlfw_inspect_globalrank-0.log"
-    stats_log = fp8_log_dir / "rank_0" / "nvdlfw_inspect_statistics_logs" / "nvdlfw_inspect_globalrank-0.log"
-
-    assert metadata_log.exists(), "Metadata log file was not created"
-    assert stats_log.exists(), "Statistics log file was not created"
-    assert metadata_log.stat().st_size > 0, "Metadata log file is empty"
-    assert stats_log.stat().st_size > 0, "Statistics log file is empty"
+    assert fp8_log_dir.exists()
+    assert (fp8_log_dir / "rank_0" / "nvdlfw_inspect_logs" / "nvdlfw_inspect_globalrank-0.log").exists()
+    assert (fp8_log_dir / "rank_0" / "nvdlfw_inspect_statistics_logs" / "nvdlfw_inspect_globalrank-0.log").exists()
 
 
 @requires_fp8
@@ -319,7 +235,7 @@ def test_sanity_mfsdp_fp8_and_model_init(tmp_path, recipe_path):
             overrides=[
                 f"+wandb_init_args.dir={tmp_path}",
                 "fp8_config.enabled=true",
-                "+config_kwargs.use_quantized_model_init=true",
+                "fp8_config.quantized_model_init_kwargs.enabled=true",
                 f"checkpoint.ckpt_dir={tmp_path}",
                 "num_train_steps=4",
             ],
@@ -338,7 +254,7 @@ def test_sanity_ddp_fp8_and_model_init(tmp_path, recipe_path):
                 f"+wandb_init_args.dir={tmp_path}",
                 f"checkpoint.ckpt_dir={tmp_path}",
                 "fp8_config.enabled=true",
-                "+config_kwargs.use_quantized_model_init=true",
+                "fp8_config.quantized_model_init_kwargs.enabled=true",
                 "num_train_steps=4",
             ],
         )
@@ -355,7 +271,7 @@ def test_sanity_convergence_fsdp2_fp8_and_model_init(tmp_path, recipe_path):
             overrides=[
                 f"+wandb_init_args.dir={tmp_path}",
                 "fp8_config.enabled=true",
-                "+config_kwargs.use_quantized_model_init=true",
+                "fp8_config.quantized_model_init_kwargs.enabled=true",
                 f"checkpoint.ckpt_dir={tmp_path}",
             ],
         )
@@ -519,9 +435,7 @@ def test_sanity_convergence_mfsdp_huggingface_model(tmp_path, recipe_path):
             config_name="L0_sanity",
             overrides=[
                 f"+wandb_init_args.dir={tmp_path}",
-                "config_name_or_path=facebook/esm2_t6_8M_UR50D",
-                "dataset.tokenizer_name=facebook/esm2_t6_8M_UR50D",
-                "use_te=false",
+                "model_tag=facebook/esm2_t6_8M_UR50D",
             ],
         )
 
@@ -539,9 +453,7 @@ def test_sanity_convergence_ddp_huggingface_model(tmp_path, recipe_path):
             overrides=[
                 f"+wandb_init_args.dir={tmp_path}",
                 f"checkpoint.ckpt_dir={tmp_path}",
-                "config_name_or_path=facebook/esm2_t6_8M_UR50D",
-                "dataset.tokenizer_name=facebook/esm2_t6_8M_UR50D",
-                "use_te=false",
+                "model_tag=facebook/esm2_t6_8M_UR50D",
                 "checkpoint.resume_from_checkpoint=false",
             ],
         )
@@ -560,9 +472,7 @@ def test_sanity_convergence_fsdp2_huggingface_model(tmp_path, recipe_path):
             overrides=[
                 f"+wandb_init_args.dir={tmp_path}",
                 f"checkpoint.ckpt_dir={tmp_path}",
-                "config_name_or_path=facebook/esm2_t6_8M_UR50D",
-                "dataset.tokenizer_name=facebook/esm2_t6_8M_UR50D",
-                "use_te=false",
+                "model_tag=facebook/esm2_t6_8M_UR50D",
                 "checkpoint.resume_from_checkpoint=false",
             ],
         )
@@ -640,9 +550,7 @@ def test_sanity_ddp_thd_token_packing_huggingface_model(tmp_path, recipe_path):
                 f"+wandb_init_args.dir={tmp_path}",
                 f"checkpoint.ckpt_dir={tmp_path}",
                 "use_sequence_packing=true",
-                "config_name_or_path=facebook/esm2_t6_8M_UR50D",
-                "dataset.tokenizer_name=facebook/esm2_t6_8M_UR50D",
-                "use_te=false",
+                "model_tag=facebook/esm2_t6_8M_UR50D",
                 "num_train_steps=4",
                 "use_torch_compile=false",
             ],
