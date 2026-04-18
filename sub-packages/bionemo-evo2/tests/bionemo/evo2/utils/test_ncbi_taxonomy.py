@@ -18,7 +18,14 @@
 
 """Unit tests for NCBI accession parsing and taxonomy XML parsing (no network)."""
 
-from bionemo.evo2.utils.ncbi_taxonomy import _taxon_lineage_from_xml, parse_accession_from_fasta_header
+from bionemo.evo2.utils import ncbi_taxonomy
+from bionemo.evo2.utils.ncbi_taxonomy import (
+    EntrezClientConfig,
+    Evo2TaxonomyLineage,
+    _taxon_lineage_from_xml,
+    build_taxonomy_data_for_fasta_headers,
+    parse_accession_from_fasta_header,
+)
 
 
 def test_parse_accession_ref_pipe() -> None:
@@ -33,8 +40,50 @@ def test_parse_accession_first_token_refseq() -> None:
     assert parse_accession_from_fasta_header(">NM_001301011.2 Homo sapiens") == "NM_001301011.2"
 
 
+def test_parse_accession_first_token_legacy() -> None:
+    assert parse_accession_from_fasta_header(">D00214.1 Bovine enterovirus genomic RNA") == "D00214.1"
+
+
 def test_parse_accession_no_match() -> None:
     assert parse_accession_from_fasta_header(">contig_001 random") is None
+
+
+def test_build_taxonomy_data_continues_on_error(monkeypatch) -> None:
+    errors: list[tuple[str, str]] = []
+    progress: list[tuple[int, int, int, int, str]] = []
+    checkpoints: list[tuple[int, int, int, int, list[str]]] = []
+
+    def fake_fetch(accession: str, cfg: EntrezClientConfig) -> Evo2TaxonomyLineage:
+        del cfg
+        if accession == "X12345.1":
+            raise RuntimeError("boom")
+        return Evo2TaxonomyLineage(species=accession)
+
+    monkeypatch.setattr(ncbi_taxonomy, "fetch_lineage_for_accession", fake_fetch)
+
+    out = build_taxonomy_data_for_fasta_headers(
+        [
+            ">NC_045512.2 SARS-CoV-2",
+            ">X12345.1 legacy accession that fails",
+            ">D00214.1 Bovine enterovirus genomic RNA",
+        ],
+        EntrezClientConfig(email="user@example.com"),
+        continue_on_error=True,
+        progress_every=1,
+        progress_callback=lambda processed, total, successes, failures, accession: progress.append(
+            (processed, total, successes, failures, accession)
+        ),
+        error_callback=lambda accession, error: errors.append((accession, str(error))),
+        checkpoint_every=1,
+        checkpoint_callback=lambda taxonomy_data, processed, total, successes, failures: checkpoints.append(
+            (processed, total, successes, failures, sorted(taxonomy_data))
+        ),
+    )
+
+    assert sorted(out) == ["D00214.1", "NC_045512.2"]
+    assert errors == [("X12345.1", "boom")]
+    assert progress[-1] == (3, 3, 2, 1, "D00214.1")
+    assert checkpoints[-1] == (3, 3, 2, 1, ["D00214.1", "NC_045512.2"])
 
 
 def test_taxon_lineage_from_xml_minimal() -> None:

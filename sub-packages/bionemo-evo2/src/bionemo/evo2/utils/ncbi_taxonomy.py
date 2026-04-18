@@ -30,6 +30,8 @@ The terminal taxon ``ScientificName`` overrides ``species`` when the record uses
 
 from __future__ import annotations
 
+from collections.abc import Callable
+import http.client
 import json
 import re
 import time
@@ -40,13 +42,30 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
-from bionemo.evo2.utils.config import Evo2TaxonomyLineage
+from pydantic import BaseModel
+
+
+# Defined locally (instead of imported from ``bionemo.evo2.utils.config``) so
+# this module doesn't pull in NeMo/Megatron at import time, which lets the
+# taxonomy YAML be generated outside the bionemo-framework container. The
+# schema mirrors ``config.Evo2TaxonomyLineage`` exactly.
+class Evo2TaxonomyLineage(BaseModel):
+    """Pydantic model class that defines the source lineage of a DNA sequence."""
+
+    domain: None | str = None
+    phylum: None | str = None
+    clazz: None | str = None
+    order: None | str = None
+    family: None | str = None
+    genus: None | str = None
+    species: None | str = None
+
 
 _ENTREZ_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 
 # RefSeq / INSDC style accessions (first token of header).
 _ACCESSION_PATTERN = re.compile(
-    r"^(?:[A-Z]{1,2}_\d+(?:\.\d+)?|[A-Z]{2}\d{6}(?:\.\d+)?|[A-Z]{4}\d{8,}(?:\.\d+)?)$"
+    r"^(?:[A-Z]{1,2}_\d+(?:\.\d+)?|[A-Z]\d{5,6}(?:\.\d+)?|[A-Z]{2}\d{6}(?:\.\d+)?|[A-Z]{4}\d{8,}(?:\.\d+)?)$"
 )
 
 
@@ -58,6 +77,12 @@ class EntrezClientConfig:
     api_key: str | None = None
     delay_s: float = 0.35
     timeout_s: float = 120.0
+    max_retries: int = 3
+
+
+ProgressCallback = Callable[[int, int, int, int, str], None]
+ErrorCallback = Callable[[str, RuntimeError], None]
+CheckpointCallback = Callable[[dict[str, Evo2TaxonomyLineage], int, int, int, int], None]
 
 
 def read_fasta_headers(path: Path | str) -> list[str]:
@@ -111,13 +136,19 @@ def _http_get(url: str, cfg: EntrezClientConfig) -> bytes:
         headers={"User-Agent": f"bionemo-evo2-taxonomy/1.0 ({cfg.email})"},
         method="GET",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=cfg.timeout_s) as resp:
-            return resp.read()
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"NCBI HTTP {e.code}: {e.reason}") from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"NCBI request failed: {e.reason}") from e
+    retries = max(cfg.max_retries, 1)
+    for attempt in range(1, retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=cfg.timeout_s) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"NCBI HTTP {e.code}: {e.reason}") from e
+        except (urllib.error.URLError, http.client.HTTPException, OSError, TimeoutError) as e:
+            if attempt == retries:
+                raise RuntimeError(f"NCBI request failed: {e}") from e
+            time.sleep(min(cfg.delay_s * attempt, 5.0))
+
+    raise RuntimeError("NCBI request failed after exhausting retries.")
 
 
 def _esearch_db(cfg: EntrezClientConfig, db: str, term: str) -> list[str]:
@@ -310,6 +341,14 @@ def build_taxonomy_data_for_fasta_headers(
     cfg: EntrezClientConfig,
     *,
     key_from_accession: bool = True,
+    existing_taxonomy_data: dict[str, Evo2TaxonomyLineage] | None = None,
+    skip_accessions: set[str] | None = None,
+    continue_on_error: bool = False,
+    progress_every: int | None = None,
+    progress_callback: ProgressCallback | None = None,
+    error_callback: ErrorCallback | None = None,
+    checkpoint_every: int | None = None,
+    checkpoint_callback: CheckpointCallback | None = None,
 ) -> dict[str, Evo2TaxonomyLineage]:
     """Build a ``taxonomy_data`` map from FASTA headers.
 
@@ -320,12 +359,22 @@ def build_taxonomy_data_for_fasta_headers(
         headers: FASTA header lines (with or without ``>``).
         cfg: Entrez configuration.
         key_from_accession: If True, map key is the parsed accession; otherwise use full seqid (first token).
+        existing_taxonomy_data: Existing results to preserve and extend.
+        skip_accessions: Accessions that are already complete and should not be re-fetched.
+        continue_on_error: If True, log/callback per-accession failures and continue processing.
+        progress_every: Emit progress every N processed unique accessions when paired with ``progress_callback``.
+        progress_callback: Invoked as ``(processed, total, successes, failures, accession)``.
+        error_callback: Invoked for per-accession ``RuntimeError`` exceptions.
+        checkpoint_every: Write/emit checkpoints every N successful accessions when paired with
+            ``checkpoint_callback``.
+        checkpoint_callback: Invoked as ``(out, processed, total, successes, failures)``.
 
     Returns:
         Mapping suitable for :class:`Evo2PreprocessingConfig`.``taxonomy_data``.
     """
-    out: dict[str, Evo2TaxonomyLineage] = {}
-    seen_acc: set[str] = set()
+    out: dict[str, Evo2TaxonomyLineage] = dict(existing_taxonomy_data or {})
+    seen_acc: set[str] = set(skip_accessions or ())
+    entries: list[tuple[str, str]] = []
 
     for header in headers:
         acc = parse_accession_from_fasta_header(header)
@@ -334,8 +383,30 @@ def build_taxonomy_data_for_fasta_headers(
         if acc in seen_acc:
             continue
         seen_acc.add(acc)
-        lineage = fetch_lineage_for_accession(acc, cfg)
         key = acc if key_from_accession else header.split()[0].lstrip(">")
-        out[key] = lineage
+        entries.append((acc, key))
+
+    total = len(entries)
+    failures = 0
+
+    for processed, (acc, key) in enumerate(entries, start=1):
+        try:
+            lineage = fetch_lineage_for_accession(acc, cfg)
+        except RuntimeError as e:
+            failures += 1
+            if error_callback is not None:
+                error_callback(acc, e)
+            if not continue_on_error:
+                raise
+        else:
+            out[key] = lineage
+            if checkpoint_callback is not None and checkpoint_every and len(out) % checkpoint_every == 0:
+                checkpoint_callback(out, processed, total, len(out), failures)
+
+        if progress_callback is not None and progress_every and (processed % progress_every == 0 or processed == total):
+            progress_callback(processed, total, len(out), failures, acc)
+
+    if checkpoint_callback is not None and checkpoint_every and out and len(out) % checkpoint_every != 0:
+        checkpoint_callback(out, total, total, len(out), failures)
 
     return out

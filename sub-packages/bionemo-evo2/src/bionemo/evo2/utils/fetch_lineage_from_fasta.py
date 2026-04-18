@@ -25,10 +25,10 @@ import sys
 from pathlib import Path
 
 import yaml
-from nemo.utils import logging
 
 from bionemo.evo2.utils.ncbi_taxonomy import (
     EntrezClientConfig,
+    Evo2TaxonomyLineage,
     build_taxonomy_data_for_fasta_headers,
     parse_accession_from_fasta_header,
     read_fasta_headers,
@@ -38,6 +38,31 @@ from bionemo.evo2.utils.ncbi_taxonomy import (
 def _lineage_to_yaml_dict(lineage) -> dict:
     d = lineage.model_dump()
     return {k: v for k, v in d.items() if v is not None}
+
+
+def _write_taxonomy_yaml(path: Path, taxonomy_data: dict[str, object]) -> None:
+    payload = {
+        "taxonomy_data": {k: _lineage_to_yaml_dict(v) for k, v in taxonomy_data.items()},
+    }
+    text = yaml.safe_dump(payload, sort_keys=False, default_flow_style=False)
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _read_existing_taxonomy_yaml(path: Path) -> dict[str, Evo2TaxonomyLineage]:
+    if not path.exists():
+        return {}
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    entries = raw.get("taxonomy_data") or {}
+    if not isinstance(entries, dict):
+        raise RuntimeError(f"Existing YAML at {path} does not contain a taxonomy_data mapping.")
+    out: dict[str, Evo2TaxonomyLineage] = {}
+    for key, value in entries.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            continue
+        out[key] = Evo2TaxonomyLineage.model_validate(value)
+    return out
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,6 +93,21 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Write YAML here (default: stdout).",
     )
+    p.add_argument(
+        "--progress-every",
+        type=int,
+        default=100,
+        help="Print progress every N unique accessions processed (default: 100). Use 0 to disable.",
+    )
+    p.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=100,
+        help=(
+            "Write partial YAML every N successful accessions when --output is set "
+            "(default: 100). Use 0 to disable."
+        ),
+    )
     return p.parse_args()
 
 
@@ -75,34 +115,86 @@ def main() -> None:
     args = parse_args()
     headers = read_fasta_headers(args.fasta)
     if not headers:
-        logging.error("No FASTA records found in %s", args.fasta)
+        print(f"No FASTA records found in {args.fasta}", file=sys.stderr)
         sys.exit(1)
 
     missing = [h for h in headers if parse_accession_from_fasta_header(h) is None]
     for h in missing:
-        logging.warning("Could not parse nucleotide accession from header (skipped): %s", h[:200])
+        print(
+            f"Could not parse nucleotide accession from header (skipped): {h[:200]}",
+            file=sys.stderr,
+        )
+
+    existing_taxonomy_data: dict[str, Evo2TaxonomyLineage] = {}
+    completed_accessions: set[str] = set()
+    if args.output is not None and args.output.exists():
+        existing_taxonomy_data = _read_existing_taxonomy_yaml(args.output)
+        completed_accessions = set(existing_taxonomy_data)
+        print(
+            f"Loaded {len(existing_taxonomy_data)} existing taxonomy entries from {args.output}; "
+            "will skip them on resume.",
+            file=sys.stderr,
+        )
 
     cfg = EntrezClientConfig(email=args.email, api_key=args.api_key, delay_s=args.delay)
-    try:
-        taxonomy_data = build_taxonomy_data_for_fasta_headers(headers, cfg)
-    except RuntimeError as e:
-        logging.error("%s", e)
-        sys.exit(1)
+    progress_every = args.progress_every if args.progress_every > 0 else None
+    checkpoint_every = args.checkpoint_every if args.checkpoint_every > 0 else None
+
+    if checkpoint_every and args.output is None:
+        print("Checkpointing disabled because --output was not provided.", file=sys.stderr)
+        checkpoint_every = None
+
+    def on_progress(processed: int, total: int, successes: int, failures: int, accession: str) -> None:
+        print(
+            f"Processed {processed}/{total} unique accessions "
+            f"(ok={successes}, failed={failures}, last={accession})",
+            file=sys.stderr,
+        )
+
+    def on_error(accession: str, error: RuntimeError) -> None:
+        print(f"Failed to resolve accession {accession!r}: {error}", file=sys.stderr)
+
+    def on_checkpoint(
+        taxonomy_data: dict[str, object],
+        processed: int,
+        total: int,
+        successes: int,
+        failures: int,
+    ) -> None:
+        if args.output is None:
+            return
+        _write_taxonomy_yaml(args.output, taxonomy_data)
+        print(
+            f"Checkpointed {args.output} ({successes} accessions written; "
+            f"processed {processed}/{total}, failed={failures})",
+            file=sys.stderr,
+        )
+
+    taxonomy_data = build_taxonomy_data_for_fasta_headers(
+        headers,
+        cfg,
+        existing_taxonomy_data=existing_taxonomy_data,
+        skip_accessions=completed_accessions,
+        continue_on_error=True,
+        progress_every=progress_every,
+        progress_callback=on_progress,
+        error_callback=on_error,
+        checkpoint_every=checkpoint_every,
+        checkpoint_callback=on_checkpoint,
+    )
 
     if not taxonomy_data:
-        logging.error("No taxonomy entries produced (check accessions and network).")
+        print("No taxonomy entries produced (check accessions and network).", file=sys.stderr)
         sys.exit(1)
 
-    payload = {
-        "taxonomy_data": {k: _lineage_to_yaml_dict(v) for k, v in taxonomy_data.items()},
-    }
-    text = yaml.safe_dump(payload, sort_keys=False, default_flow_style=False)
-
     if args.output is not None:
-        args.output.write_text(text, encoding="utf-8")
-        logging.info("Wrote %s (%d accessions)", args.output, len(taxonomy_data))
+        _write_taxonomy_yaml(args.output, taxonomy_data)
+        print(f"Wrote {args.output} ({len(taxonomy_data)} accessions)", file=sys.stderr)
     else:
-        sys.stdout.write(text)
+        payload = {
+            "taxonomy_data": {k: _lineage_to_yaml_dict(v) for k, v in taxonomy_data.items()},
+        }
+        sys.stdout.write(yaml.safe_dump(payload, sort_keys=False, default_flow_style=False))
 
 
 if __name__ == "__main__":
